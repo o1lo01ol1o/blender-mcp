@@ -80,7 +80,7 @@ def register_headless_session_tools(app: Any, session: SceneSession) -> None:
 
     @app.tool(name="blender_camera_render_preview", annotations=_READ_ONLY)
     async def blender_camera_render_preview(
-        max_size: PreviewPixels,
+        max_size: PreviewPixels = 800,
     ) -> Image | dict[str, Any]:
         try:
             request = parse_camera_render_preview_request(max_size)

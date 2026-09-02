@@ -3,14 +3,12 @@
     "additionalProperties": false,
     "properties": {
       "max_size": {
+        "default": 800,
         "maximum": 2048,
         "minimum": 64,
         "type": "integer"
       }
     },
-    "required": [
-      "max_size"
-    ],
     "type": "object"
   },
   "blender_execute_code": {

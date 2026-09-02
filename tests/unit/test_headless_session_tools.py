@@ -150,9 +150,19 @@ async def test_preview_tool_returns_one_image_content_item(tmp_path: Path):
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP438DwHwAGgAJ/EEwb4QAAAABJRU5ErkJggg=="
     )
     session = SceneSession("/fake/blender", workspace=tmp_path / "session", executor=object())
-    session.camera_render_preview = lambda _size: _async_bytes(png)  # type: ignore[method-assign]
+    observed_sizes: list[int] = []
+
+    async def preview(size):
+        observed_sizes.append(size.pixels)
+        return png
+
+    session.camera_render_preview = preview  # type: ignore[method-assign]
     app = create_headless_server(session=session)
+    default_result = await app.call_tool("blender_camera_render_preview", {})
+    assert len(default_result.content) == 1
+    assert observed_sizes == [800]
     result = await app.call_tool("blender_camera_render_preview", {"max_size": 64})
+    assert observed_sizes == [800, 64]
     assert len(result.content) == 1
     assert result.content[0].type == "image"
     assert result.content[0].mimeType == "image/png"
