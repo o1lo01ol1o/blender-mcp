@@ -11,6 +11,7 @@ from blender_mcp.headless_session import (
     ErrorCode,
     ProviderError,
     SceneSession,
+    check_public_result,
     parse_camera_render_preview_request,
     parse_execute_code_request,
     parse_export_scene_request,
@@ -33,9 +34,16 @@ def _error_result(error: ProviderError) -> dict[str, Any]:
     return {"error": error.to_dict()}
 
 
-async def _boundary_call[T](fn: Callable[[], Awaitable[T]]) -> T | dict[str, Any]:
+async def _boundary_call[T](
+    fn: Callable[[], Awaitable[T]], operation: str | None = None
+) -> T | dict[str, Any]:
     try:
-        return await fn()
+        result = await fn()
+        if operation is not None:
+            if not isinstance(result, dict):
+                raise ProviderError(ErrorCode.RESULT_MALFORMED, "text tool result must be an object")
+            return check_public_result(operation, result)
+        return result
     except ProviderError as exc:
         return _error_result(exc)
     except Exception as exc:
@@ -50,7 +58,7 @@ def register_headless_session_tools(app: Any, session: SceneSession) -> None:
     @app.tool(name="blender_get_scene_info", annotations=_READ_ONLY)
     async def blender_get_scene_info() -> dict[str, Any]:
         parse_get_scene_info_request()
-        result = await _boundary_call(session.get_scene_info)
+        result = await _boundary_call(session.get_scene_info, "get_scene_info")
         return result  # type: ignore[return-value]
 
     @app.tool(name="blender_execute_code", annotations=_MUTATING)
@@ -59,7 +67,9 @@ def register_headless_session_tools(app: Any, session: SceneSession) -> None:
             request = parse_execute_code_request(code)
         except ProviderError as exc:
             return _error_result(exc)
-        result = await _boundary_call(lambda: session.execute_code(request.program))
+        result = await _boundary_call(
+            lambda: session.execute_code(request.program), "execute_code"
+        )
         return result  # type: ignore[return-value]
 
     @app.tool(name="blender_camera_render_preview", annotations=_READ_ONLY)
@@ -85,7 +95,9 @@ def register_headless_session_tools(app: Any, session: SceneSession) -> None:
             request = parse_import_asset_request(path, format, session.staged_asset_roots)
         except ProviderError as exc:
             return _error_result(exc)
-        result = await _boundary_call(lambda: session.import_asset(request.path, request.format))
+        result = await _boundary_call(
+            lambda: session.import_asset(request.path, request.format), "import_asset"
+        )
         return result  # type: ignore[return-value]
 
     @app.tool(name="blender_export_scene", annotations=_EXPORT)
@@ -97,7 +109,8 @@ def register_headless_session_tools(app: Any, session: SceneSession) -> None:
         except ProviderError as exc:
             return _error_result(exc)
         result = await _boundary_call(
-            lambda: session.export_scene(request.path, request.format, request.selection_only)
+            lambda: session.export_scene(request.path, request.format, request.selection_only),
+            "export_scene",
         )
         return result  # type: ignore[return-value]
 

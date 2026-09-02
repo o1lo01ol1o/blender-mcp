@@ -21,8 +21,8 @@ from typing import Any
 from blender_mcp.utils.blender_executor import (
     StrictBlenderExecutor,
     StrictExecutionError,
+    StrictFailureKind,
     plan_strict_command,
-    validate_strict_blender_executable,
 )
 
 WIRE_VERSION = "blender-headless-session/v1"
@@ -668,21 +668,31 @@ def _require_exact_fields(data: Mapping[str, Any], fields: set[str], label: str)
 
 
 def _parse_execute_result(data: dict[str, Any], revision: int) -> dict[str, Any]:
-    _require_exact_fields(data, {"scene_revision", "saved", "stdout"}, "execute-code")
-    if data["scene_revision"] != revision or isinstance(data["scene_revision"], bool):
+    _require_exact_fields(data, {"scene_revision", "saved", "inspected", "stdout"}, "execute-code")
+    if (
+        isinstance(data["scene_revision"], bool)
+        or not isinstance(data["scene_revision"], int)
+        or data["scene_revision"] != revision
+    ):
         raise ProviderError(ErrorCode.RESULT_MALFORMED, "execute-code revision metadata is invalid")
-    if data["saved"] is not True or not isinstance(data["stdout"], str):
+    if data["saved"] is not True or data["inspected"] is not True or not isinstance(data["stdout"], str):
         raise ProviderError(ErrorCode.RESULT_MALFORMED, "execute-code result types are invalid")
     return {"scene_revision": revision, "stdout": data["stdout"], "saved": True}
 
 
 def _parse_import_result(data: dict[str, Any], revision: int, import_format: ImportFormat) -> dict[str, Any]:
-    _require_exact_fields(data, {"scene_revision", "imported_object_names", "format", "saved"}, "import")
+    _require_exact_fields(
+        data,
+        {"scene_revision", "imported_object_names", "format", "saved", "inspected"},
+        "import",
+    )
     names = data["imported_object_names"]
     if (
-        data["scene_revision"] != revision
-        or isinstance(data["scene_revision"], bool)
+        isinstance(data["scene_revision"], bool)
+        or not isinstance(data["scene_revision"], int)
+        or data["scene_revision"] != revision
         or data["saved"] is not True
+        or data["inspected"] is not True
         or data["format"] != import_format.value
         or not isinstance(names, list)
         or not names
@@ -696,8 +706,9 @@ def _parse_import_result(data: dict[str, Any], revision: int, import_format: Imp
 def _parse_export_result(data: dict[str, Any], revision: int, output_path: Path, export_format: ExportFormat) -> dict[str, Any]:
     _require_exact_fields(data, {"scene_revision", "path", "format"}, "export")
     if (
-        data["scene_revision"] != revision
-        or isinstance(data["scene_revision"], bool)
+        isinstance(data["scene_revision"], bool)
+        or not isinstance(data["scene_revision"], int)
+        or data["scene_revision"] != revision
         or data["path"] != str(output_path)
         or not isinstance(data["path"], str)
         or data["format"] != export_format.value
@@ -816,7 +827,7 @@ def _parse_sentinel(stdout: str) -> dict[str, Any]:
 
 
 def _script_header() -> str:
-    return f"""import bpy\nimport json\nimport sys\n\n_SENTINEL = {SENTINEL_PREFIX!r}\n_VERSION = {WIRE_VERSION!r}\n\ndef _emit(data=None, *, error_code=None, error_message=None):\n    payload = {{'wire_version': _VERSION, 'ok': error_code is None}}\n    if error_code is None:\n        payload['data'] = data or {{}}\n    else:\n        payload['error_code'] = error_code\n        payload['error_message'] = error_message or 'Blender operation failed'\n    print(_SENTINEL + json.dumps(payload, sort_keys=True, separators=(',', ':')))\n\n"""
+    return f"""import bpy\nimport json\nimport sys\n\n_SENTINEL = {SENTINEL_PREFIX!r}\n_VERSION = {WIRE_VERSION!r}\n\ndef _emit(data=None, *, error_code=None, error_message=None):\n    payload = {{'wire_version': _VERSION, 'ok': error_code is None}}\n    if error_code is None:\n        payload['data'] = data or {{}}\n    else:\n        payload['error_code'] = error_code\n        payload['error_message'] = error_message or 'Blender operation failed'\n    print(_SENTINEL + json.dumps(payload, sort_keys=True, separators=(',', ':')))\n\ndef _save_and_inspect(path):\n    bpy.ops.wm.save_as_mainfile(filepath=path)\n    bpy.ops.wm.open_mainfile(filepath=path)\n    if bpy.data.filepath != path:\n        raise RuntimeError('saved scene could not be reopened for inspection')\n\n"""
 
 
 def build_provider_script(
@@ -842,7 +853,7 @@ def build_provider_script(
             raise ValueError("execute-code requires author code and revision path")
         safe_names = repr(_SAFE_BUILTIN_NAMES)
         safe_roots = repr(tuple(sorted(_SAFE_IMPORT_ROOTS)))
-        script += f"""import contextlib\nimport io\nimport builtins as _builtins\n\ndef _safe_author_import(name, globals_=None, locals_=None, fromlist=(), level=0):\n    if level or not isinstance(name, str) or name not in {safe_roots}:\n        raise ImportError('module is not admitted')\n    checked_fromlist = fromlist or ()\n    if any(not isinstance(item, str) or item == '*' or item.startswith('_') for item in checked_fromlist):\n        raise ImportError('imported name is not admitted')\n    return _builtins.__import__(name, globals_, locals_, checked_fromlist, level)\n\n_safe_author_builtins = {{name: getattr(_builtins, name) for name in {safe_names}}}\n_safe_author_builtins['__import__'] = _safe_author_import\nfor _name in ('Exception', 'RuntimeError', 'ValueError', 'TypeError', 'IndexError', 'KeyError', 'AssertionError'):\n    _safe_author_builtins[_name] = getattr(_builtins, _name)\n_user_code = {author_code.source!r}\n_output = io.StringIO()\ntry:\n    with contextlib.redirect_stdout(_output):\n        exec(compile(_user_code, '<headless-bpy-program>', 'exec'), {{\n            '__name__': '__main__',\n            '__file__': '<headless-bpy-program>',\n            '__builtins__': _safe_author_builtins,\n        }})\n    bpy.ops.wm.save_as_mainfile(filepath={str(revision_path)!r})\n    _emit({{'scene_revision': {revision_number}, 'saved': True, 'stdout': _output.getvalue()}})\nexcept Exception as _exc:\n    _emit(error_code='ResultMalformed', error_message=str(_exc))\n    sys.exit(1)\n"""
+        script += f"""import contextlib\nimport io\nimport builtins as _builtins\n\ndef _safe_author_import(name, globals_=None, locals_=None, fromlist=(), level=0):\n    if level or not isinstance(name, str) or name not in {safe_roots}:\n        raise ImportError('module is not admitted')\n    checked_fromlist = fromlist or ()\n    if any(not isinstance(item, str) or item == '*' or item.startswith('_') for item in checked_fromlist):\n        raise ImportError('imported name is not admitted')\n    return _builtins.__import__(name, globals_, locals_, checked_fromlist, level)\n\n_safe_author_builtins = {{name: getattr(_builtins, name) for name in {safe_names}}}\n_safe_author_builtins['__import__'] = _safe_author_import\nfor _name in ('Exception', 'RuntimeError', 'ValueError', 'TypeError', 'IndexError', 'KeyError', 'AssertionError'):\n    _safe_author_builtins[_name] = getattr(_builtins, _name)\n_user_code = {author_code.source!r}\n_output = io.StringIO()\ntry:\n    with contextlib.redirect_stdout(_output):\n        exec(compile(_user_code, '<headless-bpy-program>', 'exec'), {{\n            '__name__': '__main__',\n            '__file__': '<headless-bpy-program>',\n            '__builtins__': _safe_author_builtins,\n        }})\n    _save_and_inspect({str(revision_path)!r})\n    _emit({{'scene_revision': {revision_number}, 'saved': True, 'inspected': True, 'stdout': _output.getvalue()}})\nexcept Exception as _exc:\n    _emit(error_code='ResultMalformed', error_message=str(_exc))\n    sys.exit(1)\n"""
     elif operation == "import_asset":
         if revision_path is None or asset_path is None or import_format is None:
             raise ValueError("import requires asset and revision paths")
@@ -854,7 +865,7 @@ def build_provider_script(
             import_call = "bpy.ops.import_scene.fbx(filepath=_path)"
         else:
             import_call = "bpy.ops.wm.usd_import(filepath=_path)"
-        script += f"""_before = {{obj.name for obj in bpy.context.scene.objects}}\ntry:\n    _path = {str(asset_path)!r}\n    {import_call}\n    _names = [obj.name for obj in bpy.context.scene.objects if obj.name not in _before]\n    bpy.ops.wm.save_as_mainfile(filepath={str(revision_path)!r})\n    _emit({{'scene_revision': {revision_number}, 'imported_object_names': _names, 'format': {import_format.value!r}, 'saved': True}})\nexcept Exception as _exc:\n    _emit(error_code='ResultMalformed', error_message=str(_exc))\n    sys.exit(1)\n"""
+        script += f"""_before = {{obj.name for obj in bpy.context.scene.objects}}\ntry:\n    _path = {str(asset_path)!r}\n    {import_call}\n    _names = [obj.name for obj in bpy.context.scene.objects if obj.name not in _before]\n    _save_and_inspect({str(revision_path)!r})\n    _emit({{'scene_revision': {revision_number}, 'imported_object_names': _names, 'format': {import_format.value!r}, 'saved': True, 'inspected': True}})\nexcept Exception as _exc:\n    _emit(error_code='ResultMalformed', error_message=str(_exc))\n    sys.exit(1)\n"""
     elif operation == "camera_render_preview":
         if preview_path is None or preview_size is None:
             raise ValueError("preview requires output path and size")
@@ -904,21 +915,22 @@ class SceneSession:
         # executor proves the path is Blender before creating any workspace.
         if executor is None:
             executable = Path(self.blender_executable)
+            strict_executor = StrictBlenderExecutor(
+                self.blender_executable, audit_path=process_audit_path
+            )
             if (
                 not self.blender_executable
                 or not executable.is_file()
                 or not os.access(executable, os.X_OK)
-                or not validate_strict_blender_executable(self.blender_executable)
+                or not strict_executor.validate_executable()
             ):
                 raise ProviderError(
                     ErrorCode.BLENDER_EXECUTABLE_MISSING,
                     f"Blender executable is missing or invalid: {self.blender_executable or '<unset>'}",
                 )
-        self.executor = (
-            executor
-            if executor is not None
-            else StrictBlenderExecutor(self.blender_executable, audit_path=process_audit_path)
-        )
+            self.executor = strict_executor
+        else:
+            self.executor = executor
         self.staged_asset_roots = _resolve_roots(
             staged_asset_roots, "BLENDER_MCP_STAGED_ASSET_ROOTS", ErrorCode.INVALID_ASSET_PATH
         )
@@ -934,9 +946,11 @@ class SceneSession:
         self.revision = 0
         self.current_scene: Path | None = None
         self._lock = asyncio.Lock()
+        self._teardown_lock = asyncio.Lock()
         self._active_task: asyncio.Task[Any] | None = None
         self.timeout_seconds = timeout_seconds
         self._closed = False
+        self._teardown_complete = False
 
     @property
     def active_process(self) -> Any | None:
@@ -1021,18 +1035,14 @@ class SceneSession:
                         cwd=self.workspace,
                     )
                 except StrictExecutionError as exc:
-                    message = str(exc)
-                    if "guard is unavailable" in message:
-                        code = ErrorCode.EXECUTE_CODE_GUARD_UNAVAILABLE
-                    elif "timed out" in message:
-                        code = ErrorCode.BLENDER_TIMED_OUT
-                    elif "cancelled" in message:
-                        code = ErrorCode.BLENDER_CANCELLED
-                    elif "could not start Blender" in message:
-                        code = ErrorCode.BLENDER_EXECUTABLE_MISSING
-                    else:
-                        code = ErrorCode.BLENDER_EXITED_NONZERO
-                    raise ProviderError(code, message) from exc
+                    code = {
+                        StrictFailureKind.COMMAND_INVALID: ErrorCode.INVALID_REQUEST,
+                        StrictFailureKind.GUARD_UNAVAILABLE: ErrorCode.EXECUTE_CODE_GUARD_UNAVAILABLE,
+                        StrictFailureKind.TIMED_OUT: ErrorCode.BLENDER_TIMED_OUT,
+                        StrictFailureKind.CANCELLED: ErrorCode.BLENDER_CANCELLED,
+                        StrictFailureKind.SPAWN_FAILED: ErrorCode.BLENDER_EXECUTABLE_MISSING,
+                    }[exc.kind]
+                    raise ProviderError(code, str(exc)) from exc
                 except TimeoutError as exc:
                     raise ProviderError(ErrorCode.BLENDER_TIMED_OUT, "Blender execution timed out") from exc
 
@@ -1152,25 +1162,31 @@ class SceneSession:
 
     async def teardown(self) -> None:
         """Cancel active work, reap its child, and remove the private workspace."""
-        if self._closed:
-            return
-        self._closed = True
-        task = self._active_task
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
+        async with self._teardown_lock:
+            if self._teardown_complete:
+                return
+            self._closed = True
             try:
-                await task
-            except (ProviderError, asyncio.CancelledError):
-                pass
-        active = self.active_process
-        if active is not None and active.returncode is None:
-            reap = getattr(self.executor, "_terminate_and_reap", None)
-            if reap is not None:
-                await reap(active)
-        try:
-            shutil.rmtree(self.workspace)
-        except FileNotFoundError:
-            pass
+                task = self._active_task
+                if task is not None and task is not asyncio.current_task() and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (ProviderError, asyncio.CancelledError):
+                        pass
+            finally:
+                try:
+                    active = self.active_process
+                    if active is not None and active.returncode is None:
+                        reap = getattr(self.executor, "_terminate_and_reap", None)
+                        if reap is not None:
+                            await reap(active)
+                finally:
+                    try:
+                        shutil.rmtree(self.workspace)
+                    except FileNotFoundError:
+                        pass
+                    self._teardown_complete = True
 
     async def close(self) -> None:
         """Alias for teardown used by embedding hosts."""
@@ -1236,7 +1252,7 @@ def decode_request(
     raise ProviderError(ErrorCode.INVALID_REQUEST, f"unknown request operation: {operation}")
 
 
-def _parse_public_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
+def check_public_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
     if operation == "get_scene_info":
         if "scene_revision" not in result:
             raise ProviderError(ErrorCode.RESULT_MALFORMED, "scene-info result is missing revision")
@@ -1317,7 +1333,7 @@ def encode_result(value: dict[str, Any], operation: str | None = None) -> str:
     """Encode one checked v1 result deterministically for golden tests."""
     if not isinstance(value, dict):
         raise ProviderError(ErrorCode.RESULT_MALFORMED, "result must be an object")
-    checked = _parse_public_result(operation, value) if operation is not None else value
+    checked = check_public_result(operation, value) if operation is not None else value
     return json.dumps(checked, sort_keys=True, separators=(",", ":"))
 
 
@@ -1328,7 +1344,7 @@ def decode_result(value: str, operation: str | None = None) -> dict[str, Any]:
         raise ProviderError(ErrorCode.RESULT_MALFORMED, "result is not valid JSON") from exc
     if not isinstance(result, dict):
         raise ProviderError(ErrorCode.RESULT_MALFORMED, "result must be an object")
-    return _parse_public_result(operation, result) if operation is not None else result
+    return check_public_result(operation, result) if operation is not None else result
 
 
 def validate_preview_png(png: bytes, max_size: int) -> tuple[int, int]:

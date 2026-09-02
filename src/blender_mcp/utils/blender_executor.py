@@ -11,8 +11,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, TypeVar
 
@@ -608,11 +610,28 @@ class StrictCommand:
         return self.argv[index]
 
     def __post_init__(self) -> None:
-        if not self.argv or self.argv[0] != self.executable:
-            raise ValueError("strict command argv must begin with its executable")
-        required = ("--background", "--factory-startup")
-        if any(flag not in self.argv for flag in required):
-            raise ValueError("strict command must include --background and --factory-startup")
+        if not self.executable:
+            raise ValueError("strict command requires a Blender executable")
+        prefix = (self.executable, "--background", "--factory-startup")
+        if self.argv[:3] != prefix:
+            raise ValueError("strict command must begin with executable and strict-headless flags")
+        forbidden = {"--no-background", "--window-geometry", "--window-border", "--start-console"}
+        if forbidden.intersection(self.argv):
+            raise ValueError("strict command cannot contain GUI-mode flags")
+        if self.argv[3:] == ("--version",):
+            return
+        try:
+            python_index = self.argv.index("--python")
+        except ValueError as exc:
+            raise ValueError("strict operation command requires a provider script") from exc
+        if python_index not in {3, 4}:
+            raise ValueError("strict operation command has an invalid scene position")
+        if python_index == 4 and not Path(self.argv[3]).is_absolute():
+            raise ValueError("strict command scene path must be absolute")
+        if python_index + 2 >= len(self.argv) or self.argv[python_index + 2] != "--":
+            raise ValueError("strict operation command must delimit operation arguments")
+        if not Path(self.argv[python_index + 1]).is_absolute():
+            raise ValueError("strict command provider script must be absolute")
 
 
 @dataclass(frozen=True)
@@ -622,6 +641,16 @@ class RawBlenderObservation:
     returncode: int
     stdout: str
     stderr: str
+
+
+class StrictFailureKind(StrEnum):
+    """Closed executor failure reasons, independent of display wording."""
+
+    COMMAND_INVALID = "command_invalid"
+    GUARD_UNAVAILABLE = "guard_unavailable"
+    SPAWN_FAILED = "spawn_failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
 
 
 class StrictProcessGuard(Protocol):
@@ -662,24 +691,6 @@ def plan_strict_command(
     return StrictCommand(executable=executable, argv=tuple(argv))
 
 
-def validate_strict_blender_executable(executable: str, *, timeout: float = 20.0) -> bool:
-    """Prove an explicit executable identifies Blender without a GUI launch."""
-    try:
-        command = plan_strict_command(executable, None, None, version_probe=True)
-        result = subprocess.run(
-            command.argv,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return False
-    first_line = result.stdout.splitlines()[0] if result.stdout.splitlines() else ""
-    return result.returncode == 0 and first_line.startswith("Blender ")
-
-
 # Compatibility aliases; there is still exactly one implementation.
 build_strict_argv = plan_strict_command
 plan_headless_argv = plan_strict_command
@@ -714,13 +725,19 @@ class MacOSDescendantProcessGuard:
     def wrap(self, argv: tuple[str, ...]) -> tuple[str, ...]:
         sandbox_exec = shutil.which("sandbox-exec")
         if not self.available() or sandbox_exec is None:
-            raise StrictExecutionError("descendant process guard is unavailable")
+            raise StrictExecutionError(
+                StrictFailureKind.GUARD_UNAVAILABLE, "descendant process guard is unavailable"
+            )
         profile = build_macos_process_profile(self.blender_executable)
         return (sandbox_exec, "-p", profile, *argv)
 
 
 class StrictExecutionError(RuntimeError):
-    """Subprocess lifecycle failure before operation output can be parsed."""
+    """Typed subprocess lifecycle failure before output can be parsed."""
+
+    def __init__(self, kind: StrictFailureKind, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 class StrictBlenderExecutor:
@@ -741,6 +758,38 @@ class StrictBlenderExecutor:
         self.audit_path = Path(configured_audit) if configured_audit else None
         self.active_process: asyncio.subprocess.Process | None = None
 
+    async def _probe_executable(self, timeout: float) -> bool:
+        command = plan_strict_command(self.blender_executable, None, None, version_probe=True)
+        try:
+            observation = await self.execute(command, timeout=timeout)
+        except (StrictExecutionError, OSError, ValueError):
+            return False
+        lines = observation.stdout.splitlines()
+        return observation.returncode == 0 and bool(lines) and lines[0].startswith("Blender ")
+
+    def validate_executable(self, *, timeout: float = 20.0) -> bool:
+        """Validate Blender through this executor, including ownership and audit."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self._probe_executable(timeout))
+
+        result: list[bool] = []
+        failure: list[BaseException] = []
+
+        def run_probe() -> None:
+            try:
+                result.append(asyncio.run(self._probe_executable(timeout)))
+            except BaseException as exc:  # pragma: no cover - defensive thread handoff
+                failure.append(exc)
+
+        thread = threading.Thread(target=run_probe, name="blender-executable-probe")
+        thread.start()
+        thread.join()
+        if failure:
+            raise failure[0]
+        return result == [True]
+
     async def execute(
         self,
         command: StrictCommand,
@@ -751,12 +800,21 @@ class StrictBlenderExecutor:
     ) -> RawBlenderObservation:
         """Run one planned command without a shell and always reap its child."""
         if command.executable != self.blender_executable:
-            raise StrictExecutionError("command executable does not match configured executable")
-        if execute_code:
-            if not self.process_guard.available():
-                self._write_process_audit(command, command.argv, {}, {}, None, None)
-                raise StrictExecutionError("descendant process guard is unavailable")
+            raise StrictExecutionError(
+                StrictFailureKind.COMMAND_INVALID,
+                "command executable does not match configured executable",
+            )
+        guard_available = self.process_guard.available()
+        if execute_code and not guard_available:
+            self._write_process_audit(command, command.argv, {}, {}, None, None)
+            raise StrictExecutionError(
+                StrictFailureKind.GUARD_UNAVAILABLE, "descendant process guard is unavailable"
+            )
+        if guard_available:
             try:
+                # On the accepted macOS host, apply the no-descendant policy
+                # to every provider launch. Execute-code additionally fails
+                # closed when this capability is unavailable.
                 launch_argv = self.process_guard.wrap(command.argv)
             except StrictExecutionError:
                 self._write_process_audit(command, command.argv, {}, {}, None, None)
@@ -764,8 +822,8 @@ class StrictBlenderExecutor:
         else:
             launch_argv = command.argv
 
-        try:
-            process = await asyncio.create_subprocess_exec(
+        spawn_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(
                 *launch_argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
@@ -773,9 +831,37 @@ class StrictBlenderExecutor:
                 cwd=str(cwd) if cwd is not None else None,
                 env=os.environ.copy(),
             )
+        )
+        try:
+            process = await asyncio.shield(spawn_task)
+        except asyncio.CancelledError as exc:
+            # Shield process creation so cancellation cannot lose ownership of
+            # a child created between the syscall and handle publication.
+            try:
+                process = await spawn_task
+            except (FileNotFoundError, PermissionError):
+                self._write_process_audit(command, launch_argv, {}, {}, None, None)
+            else:
+                self.active_process = process
+                observed: dict[int, list[str]] = {}
+                self._capture_process(process.pid, observed)
+                try:
+                    await asyncio.shield(
+                        self._terminate_and_reap(process, observed=observed)
+                    )
+                finally:
+                    self._write_process_audit(
+                        command, launch_argv, {}, observed, process.pid, None
+                    )
+                    self.active_process = None
+            raise StrictExecutionError(
+                StrictFailureKind.CANCELLED, "Blender execution was cancelled during spawn"
+            ) from exc
         except (FileNotFoundError, PermissionError) as exc:
             self._write_process_audit(command, launch_argv, {}, {}, None, None)
-            raise StrictExecutionError(f"could not start Blender: {exc}") from exc
+            raise StrictExecutionError(
+                StrictFailureKind.SPAWN_FAILED, f"could not start Blender: {exc}"
+            ) from exc
 
         self.active_process = process
         captured: dict[int, psutil.Process] = {}
@@ -789,10 +875,14 @@ class StrictBlenderExecutor:
                 stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
             except TimeoutError as exc:
                 await self._terminate_and_reap(process, captured=captured, observed=observed)
-                raise StrictExecutionError(f"Blender timed out after {timeout:g}s") from exc
+                raise StrictExecutionError(
+                    StrictFailureKind.TIMED_OUT, f"Blender timed out after {timeout:g}s"
+                ) from exc
             except asyncio.CancelledError as exc:
                 await asyncio.shield(self._terminate_and_reap(process, captured=captured, observed=observed))
-                raise StrictExecutionError("Blender execution was cancelled") from exc
+                raise StrictExecutionError(
+                    StrictFailureKind.CANCELLED, "Blender execution was cancelled"
+                ) from exc
             # The parent may already be gone here.  Always use the captured
             # handles rather than relying on a post-exit parent lookup.
             await self._reap_descendants(process, captured=captured, observed=observed)

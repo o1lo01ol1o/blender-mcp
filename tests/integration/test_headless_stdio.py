@@ -4,8 +4,10 @@ import base64
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import time
 import zlib
 from pathlib import Path
 
@@ -111,6 +113,48 @@ def test_headless_stdio_missing_explicit_blender_fails_clearly():
     assert "BlenderExecutableMissing" in result.stderr or "Blender executable is missing" in result.stderr
 
 
+@pytest.mark.integration
+@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit Blender executable is unavailable")
+def test_headless_stdio_sigterm_removes_private_workspace(tmp_path: Path):
+    root = Path(__file__).parents[2]
+    session_temp = tmp_path / "session-temp"
+    session_temp.mkdir()
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(root / "src"),
+        "BLENDER_EXECUTABLE": str(EXPLICIT_BLENDER),
+        "TMPDIR": str(session_temp),
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-m", "blender_mcp.headless_server"],
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        workspaces: list[Path] = []
+        while time.monotonic() < deadline and process.poll() is None:
+            workspaces = list(session_temp.glob("blender-headless-session-*"))
+            if workspaces:
+                break
+            time.sleep(0.05)
+        assert len(workspaces) == 1, "server did not create its private workspace"
+        # Signal immediately after acquisition to exercise ownership transfer,
+        # before FastMCP app construction is guaranteed to have completed.
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=15)
+        assert process.returncode == 0, stderr
+        assert stdout == ""
+        assert not list(session_temp.glob("blender-headless-session-*"))
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
 @pytest.mark.asyncio
 @pytest.mark.integration
 @pytest.mark.slow
@@ -207,12 +251,14 @@ async def test_real_fastmcp_stdio_headless_scene_flow(tmp_path: Path):
     )
     assert re.search(r"Blender 4\.2\.3(?: LTS)?", version.stdout)
     records = [json.loads(line) for line in audit.read_text().splitlines()]
-    assert len(records) == 5
+    assert len(records) == 6
+    assert records[0]["planned_argv"][-1] == "--version"
     assert all(record["direct_process_gone"] and record["descendants_gone"] for record in records)
     for record in records:
         planned = record["planned_argv"]
         assert planned[0] == str(EXPLICIT_BLENDER)
         assert "--background" in planned and "--factory-startup" in planned
+        assert Path(record["launch_argv"][0]).name == "sandbox-exec"
         direct = record["direct_process"]
         assert direct is not None
         assert record["provider_descendants"] == [], "provider operations must not spawn descendants"

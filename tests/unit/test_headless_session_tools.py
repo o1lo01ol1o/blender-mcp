@@ -115,6 +115,66 @@ async def test_preview_tool_returns_one_image_content_item(tmp_path: Path):
     assert result.content[0].type == "image"
     assert result.content[0].mimeType == "image/png"
     assert not hasattr(result.content[0], "text") or result.content[0].text is None
+    golden_path = (
+        Path(__file__).parents[1]
+        / "golden/blender_headless_session_v1/camera_render_preview.result.json"
+    )
+    golden = json.loads(golden_path.read_text())
+    assert {
+        "content": [
+            {
+                "type": result.content[0].type,
+                "data": result.content[0].data,
+                "mimeType": result.content[0].mimeType,
+            }
+        ]
+    } == golden
+    await session.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_text_result_goldens_cross_the_live_fastmcp_boundary(tmp_path: Path):
+    root = Path(__file__).parents[1] / "golden/blender_headless_session_v1"
+    staged = tmp_path / "staged"
+    approved = tmp_path / "approved"
+    staged.mkdir()
+    approved.mkdir()
+    asset = staged / "asset.glb"
+    asset.write_bytes(b"glTF")
+    session = SceneSession(
+        "/fake/blender",
+        workspace=tmp_path / "session",
+        executor=object(),
+        staged_asset_roots=[staged],
+        approved_output_roots=[approved],
+    )
+
+    async def golden_result(operation: str) -> dict:
+        return json.loads((root / f"{operation}.result.json").read_text())
+
+    session.get_scene_info = lambda: golden_result("get_scene_info")  # type: ignore[method-assign]
+    session.execute_code = lambda _program: golden_result("execute_code")  # type: ignore[method-assign]
+    session.import_asset = lambda _path, _format: golden_result("import_asset")  # type: ignore[method-assign]
+    session.export_scene = lambda _path, _format, _selection: golden_result("export_scene")  # type: ignore[method-assign]
+    app = create_headless_server(session=session)
+    calls = [
+        ("blender_get_scene_info", {}, "get_scene_info"),
+        (
+            "blender_execute_code",
+            json.loads((root / "execute_code.request.json").read_text()),
+            "execute_code",
+        ),
+        ("blender_import_asset", {"path": str(asset), "format": "glb"}, "import_asset"),
+        (
+            "blender_export_scene",
+            {"path": str(approved / "scene.blend"), "format": "blend", "selection_only": False},
+            "export_scene",
+        ),
+    ]
+    for tool, arguments, operation in calls:
+        result = await app.call_tool(tool, arguments)
+        assert json.loads(result.content[0].text) == await golden_result(operation)
     await session.teardown()
 
 

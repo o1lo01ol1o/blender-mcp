@@ -16,6 +16,7 @@ from blender_mcp.headless_session import (
     ExportFormat,
     ProviderError,
     SceneSession,
+    _parse_execute_result,
     _parse_scene_info,
     _parse_sentinel,
     admit_headless_bpy_program,
@@ -35,7 +36,9 @@ from blender_mcp.headless_session import (
 from blender_mcp.utils.blender_executor import (
     RawBlenderObservation,
     StrictBlenderExecutor,
+    StrictCommand,
     StrictExecutionError,
+    StrictFailureKind,
     plan_strict_command,
 )
 
@@ -53,13 +56,24 @@ class FakeExecutor:
         if self.fail:
             return RawBlenderObservation(1, "", "failed")
         if operation in {"execute_code", "import_asset"}:
-            matches = re.findall(r"filepath=([\"'])(.+?)\1", script)
+            matches = re.findall(r"(?:filepath=|_save_and_inspect\()([\"'])(.+?)\1", script)
             revision_path = Path(matches[0][1])
             revision_path.write_bytes(b"BLENDER-v402" + b"\0" * 32)
         if operation == "execute_code":
-            data = {"scene_revision": 1, "saved": True, "stdout": "ok\n"}
+            data = {
+                "scene_revision": 1,
+                "saved": True,
+                "inspected": True,
+                "stdout": "ok\n",
+            }
         elif operation == "import_asset":
-            data = {"scene_revision": 1, "imported_object_names": ["AssetRoot"], "format": "glb", "saved": True}
+            data = {
+                "scene_revision": 1,
+                "imported_object_names": ["AssetRoot"],
+                "format": "glb",
+                "saved": True,
+                "inspected": True,
+            }
         elif operation == "get_scene_info":
             data = {
                 "scene_name": "Scene",
@@ -94,6 +108,45 @@ def test_strict_planner_has_only_headless_flags(tmp_path: Path):
         "--factory-startup",
         "--version",
     )
+    with pytest.raises(ValueError, match="strict-headless flags"):
+        StrictCommand(
+            executable="/Applications/Blender.app/Contents/MacOS/Blender",
+            argv=(
+                "/Applications/Blender.app/Contents/MacOS/Blender",
+                "--factory-startup",
+                "--background",
+                "--version",
+            ),
+        )
+    with pytest.raises(ValueError, match="GUI-mode flags"):
+        StrictCommand(
+            executable="/Applications/Blender.app/Contents/MacOS/Blender",
+            argv=(
+                "/Applications/Blender.app/Contents/MacOS/Blender",
+                "--background",
+                "--factory-startup",
+                "--window-geometry",
+            ),
+        )
+
+
+def test_prototype_sources_contain_no_gui_or_virtual_display_path():
+    root = Path(__file__).parents[2]
+    sources = [
+        root / "src/blender_mcp/headless_server.py",
+        root / "src/blender_mcp/headless_session.py",
+        root / "src/blender_mcp/tools/headless_session_tools.py",
+    ]
+    prototype_source = "\n".join(path.read_text() for path in sources)
+    for forbidden in (
+        "Xvfb",
+        "bpy.app.timers",
+        "screenshot_viewport",
+        "bpy.ops.render.opengl",
+        "--window-geometry",
+        "--no-background",
+    ):
+        assert forbidden not in prototype_source
 
 
 @pytest.mark.unit
@@ -167,6 +220,18 @@ def test_checked_formats_and_preview_bounds():
     assert caught.value.code is ErrorCode.UNSUPPORTED_IMPORT_FORMAT
 
 
+def test_mutation_scripts_reopen_revision_before_reporting_success(tmp_path: Path):
+    script = build_provider_script(
+        "execute_code",
+        revision_number=1,
+        revision_path=tmp_path / "revision.blend",
+        author_code=admit_headless_bpy_program("print('ok')"),
+    )
+    call = f"_save_and_inspect({str(tmp_path / 'revision.blend')!r})"
+    assert "bpy.ops.wm.open_mainfile(filepath=path)" in script
+    assert script.index(call) < script.index("'inspected': True")
+
+
 def test_usd_selection_is_admitted_and_planned(tmp_path: Path):
     approved = tmp_path / "approved"
     approved.mkdir()
@@ -186,6 +251,18 @@ def test_usd_selection_is_admitted_and_planned(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.unit
+async def test_initial_scene_read_fails_without_invoking_blender(tmp_path: Path):
+    executor = FakeExecutor()
+    session = SceneSession("/fake/blender", workspace=tmp_path / "session", executor=executor)
+    with pytest.raises(ProviderError) as caught:
+        await session.get_scene_info()
+    assert caught.value.code is ErrorCode.SCENE_NOT_INITIALIZED
+    assert executor.commands == []
+    await session.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
 async def test_failed_mutation_does_not_publish_revision(tmp_path: Path):
     executor = FakeExecutor(fail=True)
     session = SceneSession("/fake/blender", workspace=tmp_path / "session", executor=executor)
@@ -194,6 +271,23 @@ async def test_failed_mutation_does_not_publish_revision(tmp_path: Path):
     assert caught.value.code is ErrorCode.BLENDER_EXITED_NONZERO
     assert session.revision == 0
     assert session.current_scene is None
+    assert list(session.workspace.iterdir()) == []
+    await session.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_failed_spawn_cleans_operation_and_temporary_revision_files(tmp_path: Path):
+    class SpawnFailureExecutor(FakeExecutor):
+        async def execute(self, command, *, timeout, execute_code, cwd):
+            raise StrictExecutionError(StrictFailureKind.SPAWN_FAILED, "could not start Blender")
+
+    session = SceneSession(
+        "/fake/blender", workspace=tmp_path / "session", executor=SpawnFailureExecutor()
+    )
+    with pytest.raises(ProviderError) as caught:
+        await session.execute_code("print('never ran')")
+    assert caught.value.code is ErrorCode.BLENDER_EXECUTABLE_MISSING
     assert list(session.workspace.iterdir()) == []
     await session.teardown()
 
@@ -366,6 +460,40 @@ async def test_teardown_cancels_active_task(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.unit
+async def test_concurrent_teardown_callers_wait_for_complete_cleanup(tmp_path: Path):
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    class SlowCancellationExecutor(FakeExecutor):
+        async def execute(self, command, *, timeout, execute_code, cwd):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release_cleanup.wait()
+                raise
+
+    session = SceneSession(
+        "/fake/blender", workspace=tmp_path / "session", executor=SlowCancellationExecutor()
+    )
+    operation = asyncio.create_task(session.execute_code("print('active')"))
+    await started.wait()
+    first = asyncio.create_task(session.teardown())
+    await cancellation_seen.wait()
+    second = asyncio.create_task(session.teardown())
+    await asyncio.sleep(0)
+    assert not second.done()
+    release_cleanup.set()
+    await asyncio.gather(first, second)
+    assert operation.done()
+    assert session._teardown_complete is True
+    assert not session.workspace.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
 async def test_descendants_are_captured_and_reaped_after_parent_exit(tmp_path: Path):
     executable = tmp_path / "fake-blender"
     executable.write_text(
@@ -412,9 +540,9 @@ async def test_session_cancellation_preserves_existing_revision(tmp_path: Path):
         "state.write_text(str(count + 1))\n"
         "if count == 0:\n"
         "    script = pathlib.Path(sys.argv[sys.argv.index('--python') + 1]).read_text()\n"
-        "    revision = pathlib.Path(re.search(r\"filepath='([^']+)'\", script).group(1))\n"
+        "    revision = pathlib.Path(re.search(r\"_save_and_inspect\\('([^']+)'\\)\", script).group(1))\n"
         "    revision.write_bytes(b'BLENDER-v402' + b'\\0' * 32)\n"
-        "    data = {'scene_revision': 1, 'saved': True, 'stdout': ''}\n"
+        "    data = {'scene_revision': 1, 'saved': True, 'inspected': True, 'stdout': ''}\n"
         "    payload = {'wire_version': 'blender-headless-session/v1', 'ok': True, 'data': data}\n"
         "    print('BLENDER_HEADLESS_SESSION_V1:' + json.dumps(payload))\n"
         "else:\n"
@@ -464,17 +592,69 @@ async def test_timeout_and_cancellation_reap_the_direct_child(tmp_path: Path):
     executable.chmod(executable.stat().st_mode | 0o111)
     script = tmp_path / "op.py"
     script.write_text("", encoding="utf-8")
-    executor = StrictBlenderExecutor(str(executable), reap_grace_seconds=0.1)
+    class NoGuard:
+        def available(self):
+            return False
+
+    executor = StrictBlenderExecutor(
+        str(executable), process_guard=NoGuard(), reap_grace_seconds=0.1
+    )
     command = plan_strict_command(str(executable), None, script)
-    with pytest.raises(StrictExecutionError, match="timed out"):
+    with pytest.raises(StrictExecutionError, match="timed out") as timed_out:
         await executor.execute(command, timeout=0.05)
+    assert timed_out.value.kind is StrictFailureKind.TIMED_OUT
     assert executor.active_process is None
 
     task = asyncio.create_task(executor.execute(command, timeout=30))
-    await asyncio.sleep(0.05)
+    while executor.active_process is None:
+        await asyncio.sleep(0)
     task.cancel()
-    with pytest.raises(StrictExecutionError, match="cancelled"):
+    with pytest.raises(StrictExecutionError, match="cancelled") as cancelled:
         await task
+    assert cancelled.value.kind is StrictFailureKind.CANCELLED
+    assert executor.active_process is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_cancellation_during_spawn_publishes_then_reaps_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    executable = tmp_path / "fake-blender"
+    executable.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n", encoding="utf-8")
+    executable.chmod(executable.stat().st_mode | 0o111)
+    script = tmp_path / "op.py"
+    script.write_text("", encoding="utf-8")
+    spawned = asyncio.Event()
+    release_spawn = asyncio.Event()
+    child: list[asyncio.subprocess.Process] = []
+    real_spawn = asyncio.create_subprocess_exec
+
+    async def delayed_spawn(*args, **kwargs):
+        process = await real_spawn(*args, **kwargs)
+        child.append(process)
+        spawned.set()
+        await release_spawn.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+
+    class NoGuard:
+        def available(self):
+            return False
+
+    executor = StrictBlenderExecutor(
+        str(executable), process_guard=NoGuard(), reap_grace_seconds=0.1
+    )
+    command = plan_strict_command(str(executable), None, script)
+    task = asyncio.create_task(executor.execute(command, timeout=30))
+    await spawned.wait()
+    task.cancel()
+    release_spawn.set()
+    with pytest.raises(StrictExecutionError, match="cancelled during spawn") as cancelled:
+        await task
+    assert cancelled.value.kind is StrictFailureKind.CANCELLED
+    assert child and not psutil.pid_exists(child[0].pid)
     assert executor.active_process is None
 
 
@@ -556,6 +736,12 @@ def test_sentinel_errors_are_distinct_and_structured():
     with pytest.raises(ProviderError) as camera:
         _parse_sentinel(SENTINEL_PREFIX + json.dumps(active_camera_error))
     assert camera.value.code is ErrorCode.ACTIVE_CAMERA_MISSING
+
+    with pytest.raises(ProviderError) as float_revision:
+        _parse_execute_result(
+            {"scene_revision": 1.0, "saved": True, "inspected": True, "stdout": ""}, 1
+        )
+    assert float_revision.value.code is ErrorCode.RESULT_MALFORMED
 
 
 def test_unknown_scene_object_kind_is_rejected():

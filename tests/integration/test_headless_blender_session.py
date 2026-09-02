@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 
+import psutil
 import pytest
 
 from blender_mcp.headless_session import SceneSession
@@ -80,6 +82,26 @@ bpy.context.object.name = 'Cube_B'
         workspace = session.workspace
         await session.teardown()
         assert not workspace.exists()
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit Blender 4.2.3 executable is unavailable")
+@pytest.mark.asyncio
+async def test_teardown_reaps_active_real_blender_child(tmp_path: Path):
+    session = SceneSession(
+        str(EXPLICIT_BLENDER), workspace=tmp_path / "session", timeout_seconds=120
+    )
+    operation = asyncio.create_task(session.execute_code("while True:\n    pass"))
+    deadline = asyncio.get_running_loop().time() + 30
+    while session.active_process is None and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    assert session.active_process is not None
+    child_pid = session.active_process.pid
+    await session.teardown()
+    assert operation.done()
+    assert not psutil.pid_exists(child_pid)
+    assert not session.workspace.exists()
 
 
 @pytest.mark.integration

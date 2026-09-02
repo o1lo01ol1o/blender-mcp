@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import sys
 from contextlib import asynccontextmanager
 
@@ -14,6 +15,16 @@ from blender_mcp.headless_session import SceneSession
 from blender_mcp.tools.headless_session_tools import register_headless_session_tools
 
 logger = logging.getLogger(__name__)
+
+
+def _is_graceful_shutdown(error: BaseException) -> bool:
+    if isinstance(error, KeyboardInterrupt):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return bool(error.exceptions) and all(
+            _is_graceful_shutdown(nested) for nested in error.exceptions
+        )
+    return False
 
 
 @asynccontextmanager
@@ -41,7 +52,7 @@ def create_headless_server(
             mask_error_details=False,
         )
         register_headless_session_tools(app, owned_session)
-    except Exception:
+    except BaseException:
         if owns_session:
             # Construction is synchronous, so this startup bracket has not
             # entered FastMCP's async lifespan yet.
@@ -61,20 +72,38 @@ def main() -> None:
         format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
     )
     session: SceneSession | None = None
+    session_ready = False
+    shutdown_requested = False
+
+    def request_shutdown(_signum: int, _frame: object) -> None:
+        nonlocal shutdown_requested
+        if session_ready:
+            raise KeyboardInterrupt
+        # Defer delivery until ownership of the newly constructed session has
+        # transferred to this stack frame, so cleanup cannot race acquisition.
+        shutdown_requested = True
+
+    previous_sigterm = signal.signal(signal.SIGTERM, request_shutdown)
     try:
         app = create_headless_server()
         session = app._headless_scene_session
+        session_ready = True
+        if shutdown_requested:
+            raise KeyboardInterrupt
         app.run(transport="stdio", show_banner=False)
-    except KeyboardInterrupt:
-        logger.info("Headless Blender MCP server stopped")
-    except Exception as exc:
-        # Startup errors are intentionally human-readable on stderr and never
-        # leak into stdout, which is reserved for MCP framing.
-        logger.error("Headless Blender MCP startup/run failed: %s", exc)
-        raise
+    except BaseException as exc:
+        if _is_graceful_shutdown(exc):
+            logger.info("Headless Blender MCP server stopped")
+        else:
+            # Startup errors are intentionally human-readable on stderr and
+            # never leak into stdout, which is reserved for MCP framing.
+            logger.error("Headless Blender MCP startup/run failed: %s", exc)
+            raise
     finally:
         if session is not None:
             asyncio.run(session.teardown())
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 main_stdio = main
