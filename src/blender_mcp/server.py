@@ -345,6 +345,24 @@ def create_server():
     return app
 
 
+def create_headless_server(*args, **kwargs):
+    """Create the dedicated strict-headless compatibility app.
+
+    Kept as a lazy wrapper so importing the broad server does not alter its
+    historical tool catalog or initialization behavior.
+    """
+    from blender_mcp.headless_server import create_headless_server as _create_headless_server
+
+    return _create_headless_server(*args, **kwargs)
+
+
+def main_headless_stdio():
+    """Run only the strict-headless five-tool compatibility entry point."""
+    from blender_mcp.headless_server import main as _main_headless
+
+    _main_headless()
+
+
 def main_stdio():
     """Entry point for stdio mode - used by most MCP clients.
 

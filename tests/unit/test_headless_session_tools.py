@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import base64
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+from blender_mcp.headless_server import create_headless_server
+from blender_mcp.headless_session import ErrorCode, ProviderError, SceneSession
+from blender_mcp.utils.blender_executor import MacOSDescendantProcessGuard, build_macos_process_profile
+
+
+@pytest.mark.unit
+def test_invalid_explicit_executable_fails_before_workspace_creation(tmp_path: Path):
+    workspace = tmp_path / "must-not-exist"
+    with pytest.raises(ProviderError) as caught:
+        SceneSession(str(tmp_path / "missing-blender"), workspace=workspace)
+    assert caught.value.code is ErrorCode.BLENDER_EXECUTABLE_MISSING
+    assert not workspace.exists()
+
+
+def test_non_blender_executable_fails_before_workspace_creation(tmp_path: Path):
+    workspace = tmp_path / "must-not-exist"
+    with pytest.raises(ProviderError) as caught:
+        SceneSession(sys.executable, workspace=workspace)
+    assert caught.value.code is ErrorCode.BLENDER_EXECUTABLE_MISSING
+    assert not workspace.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_headless_entry_point_exposes_exactly_five_tools(tmp_path: Path):
+    session = SceneSession("/fake/blender", workspace=tmp_path / "session", executor=object())
+    app = create_headless_server(session=session)
+    assert [tool.name for tool in await app.list_tools()] == [
+        "blender_get_scene_info",
+        "blender_execute_code",
+        "blender_camera_render_preview",
+        "blender_import_asset",
+        "blender_export_scene",
+    ]
+    tools = {tool.name: tool for tool in await app.list_tools()}
+    assert tools["blender_export_scene"].annotations.readOnlyHint is False
+    assert tools["blender_export_scene"].annotations.destructiveHint is True
+    await session.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_boundary_errors_are_structured_and_happen_before_execution(tmp_path: Path):
+    session = SceneSession("/fake/blender", workspace=tmp_path / "session", executor=object())
+    app = create_headless_server(session=session)
+    result = await app.call_tool("blender_execute_code", {"code": "import subprocess"})
+    assert result.content[0].text == '{"error":{"code":"InvalidRequest","message":"process, display, and socket modules are not admitted"}}'
+    await session.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_all_invalid_boundaries_skip_the_executor(tmp_path: Path):
+    class CountingExecutor:
+        def __init__(self):
+            self.calls = 0
+            self.active_process = None
+
+        async def execute(self, *args, **kwargs):
+            self.calls += 1
+            raise AssertionError("invalid boundary reached Blender")
+
+    staged = tmp_path / "staged"
+    approved = tmp_path / "approved"
+    staged.mkdir()
+    approved.mkdir()
+    executor = CountingExecutor()
+    session = SceneSession(
+        "/fake/blender",
+        workspace=tmp_path / "session",
+        executor=executor,
+        staged_asset_roots=[staged],
+        approved_output_roots=[approved],
+    )
+    app = create_headless_server(session=session)
+    invalid = [
+        ("blender_execute_code", {"code": "import builtins; builtins.__import__('os')"}),
+        ("blender_execute_code", {"code": 123}),
+        ("blender_camera_render_preview", {"max_size": 63}),
+        ("blender_camera_render_preview", {"max_size": True}),
+        ("blender_camera_render_preview", {"max_size": 2049}),
+        ("blender_import_asset", {"path": str(staged / "missing.glb"), "format": "glb"}),
+        ("blender_import_asset", {"path": str(staged / "missing.glb"), "format": "blend"}),
+        ("blender_export_scene", {"path": str(tmp_path / "outside.blend"), "format": "blend"}),
+        ("blender_export_scene", {"path": str(approved / "scene.blend"), "format": "bad"}),
+        ("blender_export_scene", {"path": str(approved / "scene.blend"), "format": "blend", "selection_only": "no"}),
+    ]
+    for name, arguments in invalid:
+        result = await app.call_tool(name, arguments)
+        assert result.content and json.loads(result.content[0].text)["error"]["code"]
+    assert executor.calls == 0
+    await session.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_preview_tool_returns_one_image_content_item(tmp_path: Path):
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP438DwHwAGgAJ/EEwb4QAAAABJRU5ErkJggg=="
+    )
+    session = SceneSession("/fake/blender", workspace=tmp_path / "session", executor=object())
+    session.camera_render_preview = lambda _size: _async_bytes(png)  # type: ignore[method-assign]
+    app = create_headless_server(session=session)
+    result = await app.call_tool("blender_camera_render_preview", {"max_size": 64})
+    assert len(result.content) == 1
+    assert result.content[0].type == "image"
+    assert result.content[0].mimeType == "image/png"
+    assert not hasattr(result.content[0], "text") or result.content[0].text is None
+    await session.teardown()
+
+
+async def _async_bytes(value: bytes) -> bytes:
+    return value
+
+
+def test_macos_guard_profile_denies_fork_and_restricts_exec():
+    profile = build_macos_process_profile("/Applications/Blender.app/Contents/MacOS/Blender")
+    assert "(deny process-fork)" in profile
+    assert "(deny process-exec)" in profile
+    assert '(allow process-exec (literal "/Applications/Blender.app/Contents/MacOS/Blender"))' in profile
+    assert MacOSDescendantProcessGuard("/Applications/Blender.app/Contents/MacOS/Blender").blender_executable.endswith("Blender")
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_execute_code_fails_closed_without_process_guard(tmp_path: Path):
+    class NoGuard:
+        def available(self):
+            return False
+
+    from blender_mcp.utils.blender_executor import StrictBlenderExecutor
+
+    executor = StrictBlenderExecutor("/bin/sh", process_guard=NoGuard())
+    session = SceneSession("/bin/sh", workspace=tmp_path / "session", executor=executor)
+    with pytest.raises(ProviderError) as caught:
+        await session.execute_code("print('no child')")
+    assert caught.value.code is ErrorCode.EXECUTE_CODE_GUARD_UNAVAILABLE
+    await session.teardown()
