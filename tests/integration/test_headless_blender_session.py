@@ -7,7 +7,7 @@ from pathlib import Path
 import psutil
 import pytest
 
-from blender_mcp.headless_session import SceneSession
+from blender_mcp.headless_session import ErrorCode, ProviderError, SceneSession
 from blender_mcp.utils.blender_executor import StrictBlenderExecutor, plan_strict_command
 
 EXPLICIT_BLENDER = Path("/Applications/Blender.app/Contents/MacOS/Blender")
@@ -82,6 +82,40 @@ bpy.context.object.name = 'Cube_B'
         workspace = session.workspace
         await session.teardown()
         assert not workspace.exists()
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit Blender 4.2.3 executable is unavailable")
+@pytest.mark.asyncio
+async def test_failed_malicious_mutation_cannot_overwrite_previous_revision(tmp_path: Path):
+    session = SceneSession(
+        str(EXPLICIT_BLENDER), workspace=tmp_path / "session", timeout_seconds=120
+    )
+    try:
+        await session.execute_code(
+            "import bpy\n"
+            "bpy.ops.mesh.primitive_cube_add()\n"
+            "bpy.ops.object.camera_add(location=(0, -5, 0))\n"
+            "bpy.context.scene.camera = bpy.context.object\n"
+        )
+        current = session.current_scene
+        assert current is not None
+        previous_bytes = current.read_bytes()
+        with pytest.raises(ProviderError) as failed:
+            await session.execute_code(
+                "import bpy\n"
+                "# This used to inherit the published .blend filepath.\n"
+                "bpy.context.scene.render.filepath = bpy.data.filepath\n"
+                "bpy.ops.render.render(write_still=True)\n"
+                "raise RuntimeError('intentional failed mutation')\n"
+            )
+        assert failed.value.code is ErrorCode.RESULT_MALFORMED
+        assert session.revision == 1
+        assert session.current_scene == current
+        assert current.read_bytes() == previous_bytes
+    finally:
+        await session.teardown()
 
 
 @pytest.mark.integration

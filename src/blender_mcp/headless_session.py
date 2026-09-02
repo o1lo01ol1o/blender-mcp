@@ -9,10 +9,12 @@ import json
 import math
 import os
 import shutil
+import stat as statmod
 import tempfile
 import uuid
 import zlib
 from collections.abc import Iterable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -22,12 +24,17 @@ from blender_mcp.utils.blender_executor import (
     StrictBlenderExecutor,
     StrictExecutionError,
     StrictFailureKind,
+    _await_uninterruptibly,
     plan_strict_command,
 )
 
 WIRE_VERSION = "blender-headless-session/v1"
 SENTINEL_PREFIX = "BLENDER_HEADLESS_SESSION_V1:"
 MAX_PROGRAM_BYTES = 1024 * 1024
+# Preserve the native callable identities for capability detection; tests and
+# race regressions may wrap os.rename without changing platform support.
+_NATIVE_OPEN = os.open
+_NATIVE_RENAME = os.rename
 
 
 class ErrorCode(StrEnum):
@@ -50,6 +57,7 @@ class ErrorCode(StrEnum):
     PREVIEW_MISSING = "PreviewMissing"
     EXPORT_MISSING = "ExportMissing"
     EXECUTE_CODE_GUARD_UNAVAILABLE = "ExecuteCodeGuardUnavailable"
+    BLENDER_LIFECYCLE_FAILURE = "BlenderLifecycleFailure"
 
 
 class ProviderError(Exception):
@@ -521,6 +529,109 @@ def _resolve_roots(
     return tuple(resolved)
 
 
+@dataclass
+class _DirectoryCapability:
+    """Held directory descriptor used for race-free path operations."""
+
+    path: Path
+    fd: int | None
+
+    def close(self) -> None:
+        if self.fd is not None:
+            with suppress(OSError):
+                os.close(self.fd)
+            self.fd = None
+
+
+def _safe_dirfd_operations_available() -> bool:
+    """Whether this host can perform the required no-follow *at operations."""
+    supported = getattr(os, "supports_dir_fd", set())
+    return bool(
+        getattr(os, "O_NOFOLLOW", 0)
+        and getattr(os, "O_DIRECTORY", 0)
+        and _NATIVE_OPEN in supported
+        and _NATIVE_RENAME in supported
+    )
+
+
+def _directory_capabilities(roots: tuple[Path, ...], error: ErrorCode) -> tuple[_DirectoryCapability, ...]:
+    """Open configured roots once; later operations never reopen by pathname."""
+    if roots and not _safe_dirfd_operations_available():
+        raise ProviderError(error, "this platform lacks safe descriptor-relative path operations")
+    capabilities: list[_DirectoryCapability] = []
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    for root in roots:
+        try:
+            capabilities.append(_DirectoryCapability(root, os.open(root, directory_flags)))
+        except OSError as exc:
+            for capability in capabilities:
+                capability.close()
+            raise ProviderError(error, f"configured root cannot be opened safely: {root}") from exc
+    return tuple(capabilities)
+
+
+def _relative_to_capability(path: Path, capability: _DirectoryCapability, error: ErrorCode) -> tuple[str, ...]:
+    try:
+        relative = path.relative_to(capability.path)
+    except ValueError as exc:
+        raise ProviderError(error, f"path is outside configured roots: {path}") from exc
+    parts = relative.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ProviderError(error, f"path is not a regular descendant: {path}")
+    return parts
+
+
+def _open_beneath(capability: _DirectoryCapability, path: Path, flags: int, error: ErrorCode) -> int:
+    """Open a path below a held root without following any component symlink."""
+    parts = _relative_to_capability(path, capability, error)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if capability.fd is None:
+        raise ProviderError(error, "configured path capability is closed")
+    directory_fd: int | None = None
+    try:
+        directory_fd = os.dup(capability.fd)
+        try:
+            for part in parts[:-1]:
+                child_fd = os.open(
+                    part,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow,
+                    dir_fd=directory_fd,
+                )
+                os.close(directory_fd)
+                directory_fd = child_fd
+            result = os.open(parts[-1], flags | nofollow, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+        stat = os.fstat(result)
+    except (OSError, ValueError, TypeError) as exc:
+        if directory_fd is not None:
+            with suppress(OSError):
+                os.close(directory_fd)
+        raise ProviderError(error, f"path cannot be opened safely: {path}") from exc
+    if not statmod.S_ISREG(stat.st_mode):
+        with suppress(OSError):
+            os.close(result)
+        raise ProviderError(error, f"path is not a regular file: {path}")
+    return result
+
+
+def _copy_fd_to_path(source_fd: int, destination: Path, error: ErrorCode) -> None:
+    """Copy bytes from an already-open source into a private exclusive file."""
+    try:
+        source = os.fdopen(source_fd, "rb", closefd=True)
+        try:
+            with destination.open("xb") as target:
+                shutil.copyfileobj(source, target)
+                target.flush()
+                os.fsync(target.fileno())
+        finally:
+            source.close()
+    except OSError as exc:
+        with suppress(OSError):
+            os.close(source_fd)
+        raise ProviderError(error, f"could not copy input into the private workspace: {destination}") from exc
+
+
 def _contained_path(path: Path, roots: tuple[Path, ...], error: ErrorCode) -> Path:
     """Return a canonical path only when it is strictly inside a root."""
     if not roots:
@@ -556,6 +667,146 @@ def parse_output_path(value: Any, roots: Iterable[str | Path] | None = None) -> 
     if path.exists() and (path.is_dir() or not path.is_file()):
         raise ProviderError(ErrorCode.INVALID_OUTPUT_PATH, f"output path is not a regular file: {path}")
     return path
+
+
+def _capability_for_path(
+    path: Path, capabilities: tuple[_DirectoryCapability, ...], error: ErrorCode
+) -> _DirectoryCapability:
+    for capability in capabilities:
+        try:
+            path.relative_to(capability.path)
+        except ValueError:
+            continue
+        return capability
+    raise ProviderError(error, f"path is outside configured roots: {path}")
+
+
+def _copy_checked_file(
+    path: Path,
+    capabilities: tuple[_DirectoryCapability, ...],
+    destination: Path,
+    error: ErrorCode,
+) -> None:
+    capability = _capability_for_path(path, capabilities, error)
+    source_fd = _open_beneath(capability, path, os.O_RDONLY, error)
+    _copy_fd_to_path(source_fd, destination, error)
+
+
+def _private_file_size(path: Path, error: ErrorCode) -> int:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            result = os.fstat(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise ProviderError(error, f"output cannot be opened safely: {path}") from exc
+    if not statmod.S_ISREG(result.st_mode) or result.st_size <= 0:
+        raise ProviderError(error, f"output is not a non-empty regular file: {path}")
+    return int(result.st_size)
+
+
+def _open_directory_beneath(capability: _DirectoryCapability, path: Path, error: ErrorCode) -> int:
+    """Open an existing destination parent below a held root."""
+    if path == capability.path:
+        if capability.fd is None:
+            raise ProviderError(error, "configured path capability is closed")
+        try:
+            return os.dup(capability.fd)
+        except OSError as exc:
+            raise ProviderError(error, f"output parent cannot be opened safely: {path}") from exc
+    parts = _relative_to_capability(path, capability, error)
+    if capability.fd is None:
+        raise ProviderError(error, "configured path capability is closed")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    current: int | None = None
+    try:
+        current = os.dup(capability.fd)
+        for part in parts:
+            child = os.open(part, flags, dir_fd=current)
+            os.close(current)
+            current = child
+        return current
+    except (OSError, TypeError) as exc:
+        if current is not None:
+            with suppress(OSError):
+                os.close(current)
+        raise ProviderError(error, f"output parent cannot be opened safely: {path}") from exc
+
+
+def _publish_private_file(
+    source: Path,
+    destination: Path,
+    capabilities: tuple[_DirectoryCapability, ...],
+    error: ErrorCode,
+) -> int:
+    """Atomically publish a private result using directory descriptors."""
+    if not _safe_dirfd_operations_available():
+        raise ProviderError(error, "this platform lacks safe descriptor-relative publication")
+    capability = _capability_for_path(destination, capabilities, error)
+    parent_fd = _open_directory_beneath(capability, destination.parent, error)
+    parent_stat = os.fstat(parent_fd)
+    parent_identity = (parent_stat.st_dev, parent_stat.st_ino, parent_stat.st_mode)
+    source_fd: int | None = None
+    source_parent_fd: int | None = None
+    published_fd: int | None = None
+    verification_parent_fd: int | None = None
+    try:
+        # Open the private source without following a late symlink swap, then
+        # rename by descriptor-relative names into the held approved parent.
+        source_parent_fd = os.open(
+            source.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        source_fd = os.open(source.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_parent_fd)
+        source_stat = os.fstat(source_fd)
+        if not statmod.S_ISREG(source_stat.st_mode) or source_stat.st_size <= 0:
+            raise ProviderError(error, "private output is not a non-empty regular file")
+        source_identity = (source_stat.st_dev, source_stat.st_ino)
+        os.rename(
+            source.name,
+            destination.name,
+            src_dir_fd=source_parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        # Ensure the checked destination parent still names the descriptor
+        # acquired before publication.  A late replacement becomes a typed
+        # failure rather than publishing into a detached or attacker-chosen
+        # directory.
+        verification_parent_fd = _open_directory_beneath(capability, destination.parent, error)
+        verified_stat = os.fstat(verification_parent_fd)
+        if (verified_stat.st_dev, verified_stat.st_ino, verified_stat.st_mode) != parent_identity:
+            raise ProviderError(error, "destination parent changed during publication")
+        # Verify the published object through the already-held destination
+        # descriptor, never by reopening the absolute destination pathname.
+        published_fd = os.open(destination.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        published_stat = os.fstat(published_fd)
+        if (
+            not statmod.S_ISREG(published_stat.st_mode)
+            or published_stat.st_size != source_stat.st_size
+            or (published_stat.st_dev, published_stat.st_ino) != source_identity
+        ):
+            raise ProviderError(error, "published output is not the verified private file")
+        return int(published_stat.st_size)
+    except ProviderError:
+        raise
+    except (OSError, TypeError) as exc:
+        raise ProviderError(error, f"could not publish output atomically: {destination}") from exc
+    finally:
+        if source_fd is not None:
+            with suppress(OSError):
+                os.close(source_fd)
+        if source_parent_fd is not None:
+            with suppress(OSError):
+                os.close(source_parent_fd)
+        if published_fd is not None:
+            with suppress(OSError):
+                os.close(published_fd)
+        if verification_parent_fd is not None:
+            with suppress(OSError):
+                os.close(verification_parent_fd)
+        with suppress(OSError):
+            os.close(parent_fd)
 
 
 def parse_get_scene_info_request() -> GetSceneInfoRequest:
@@ -827,7 +1078,7 @@ def _parse_sentinel(stdout: str) -> dict[str, Any]:
 
 
 def _script_header() -> str:
-    return f"""import bpy\nimport json\nimport sys\n\n_SENTINEL = {SENTINEL_PREFIX!r}\n_VERSION = {WIRE_VERSION!r}\n\ndef _emit(data=None, *, error_code=None, error_message=None):\n    payload = {{'wire_version': _VERSION, 'ok': error_code is None}}\n    if error_code is None:\n        payload['data'] = data or {{}}\n    else:\n        payload['error_code'] = error_code\n        payload['error_message'] = error_message or 'Blender operation failed'\n    print(_SENTINEL + json.dumps(payload, sort_keys=True, separators=(',', ':')))\n\ndef _save_and_inspect(path):\n    bpy.ops.wm.save_as_mainfile(filepath=path)\n    bpy.ops.wm.open_mainfile(filepath=path)\n    if bpy.data.filepath != path:\n        raise RuntimeError('saved scene could not be reopened for inspection')\n\n"""
+    return f"""import bpy\nimport json\nimport sys\n\n_SENTINEL = {SENTINEL_PREFIX!r}\n_VERSION = {WIRE_VERSION!r}\n\ndef _emit(data=None, *, error_code=None, error_message=None):\n    payload = {{'wire_version': _VERSION, 'ok': error_code is None}}\n    if error_code is None:\n        payload['data'] = data or {{}}\n    else:\n        payload['error_code'] = error_code\n        payload['error_message'] = error_message or 'Blender operation failed'\n    print(_SENTINEL + json.dumps(payload, sort_keys=True, separators=(',', ':')))\n\ndef _prepare_private_scene(path):\n    # Saving once before author code makes bpy.data.filepath point at the\n    # private next-revision path; BlendData.filepath itself is read-only.\n    bpy.ops.wm.save_as_mainfile(filepath=path)\n\ndef _save_and_inspect(path):\n    bpy.ops.wm.save_as_mainfile(filepath=path)\n    bpy.ops.wm.open_mainfile(filepath=path)\n    if bpy.data.filepath != path:\n        raise RuntimeError('saved scene could not be reopened for inspection')\n\n"""
 
 
 def build_provider_script(
@@ -853,7 +1104,7 @@ def build_provider_script(
             raise ValueError("execute-code requires author code and revision path")
         safe_names = repr(_SAFE_BUILTIN_NAMES)
         safe_roots = repr(tuple(sorted(_SAFE_IMPORT_ROOTS)))
-        script += f"""import contextlib\nimport io\nimport builtins as _builtins\n\ndef _safe_author_import(name, globals_=None, locals_=None, fromlist=(), level=0):\n    if level or not isinstance(name, str) or name not in {safe_roots}:\n        raise ImportError('module is not admitted')\n    checked_fromlist = fromlist or ()\n    if any(not isinstance(item, str) or item == '*' or item.startswith('_') for item in checked_fromlist):\n        raise ImportError('imported name is not admitted')\n    return _builtins.__import__(name, globals_, locals_, checked_fromlist, level)\n\n_safe_author_builtins = {{name: getattr(_builtins, name) for name in {safe_names}}}\n_safe_author_builtins['__import__'] = _safe_author_import\nfor _name in ('Exception', 'RuntimeError', 'ValueError', 'TypeError', 'IndexError', 'KeyError', 'AssertionError'):\n    _safe_author_builtins[_name] = getattr(_builtins, _name)\n_user_code = {author_code.source!r}\n_output = io.StringIO()\ntry:\n    with contextlib.redirect_stdout(_output):\n        exec(compile(_user_code, '<headless-bpy-program>', 'exec'), {{\n            '__name__': '__main__',\n            '__file__': '<headless-bpy-program>',\n            '__builtins__': _safe_author_builtins,\n        }})\n    _save_and_inspect({str(revision_path)!r})\n    _emit({{'scene_revision': {revision_number}, 'saved': True, 'inspected': True, 'stdout': _output.getvalue()}})\nexcept Exception as _exc:\n    _emit(error_code='ResultMalformed', error_message=str(_exc))\n    sys.exit(1)\n"""
+        script += f"""import contextlib\nimport io\nimport builtins as _builtins\n\ndef _safe_author_import(name, globals_=None, locals_=None, fromlist=(), level=0):\n    if level or not isinstance(name, str) or name not in {safe_roots}:\n        raise ImportError('module is not admitted')\n    checked_fromlist = fromlist or ()\n    if any(not isinstance(item, str) or item == '*' or item.startswith('_') for item in checked_fromlist):\n        raise ImportError('imported name is not admitted')\n    return _builtins.__import__(name, globals_, locals_, checked_fromlist, level)\n\n_safe_author_builtins = {{name: getattr(_builtins, name) for name in {safe_names}}}\n_safe_author_builtins['__import__'] = _safe_author_import\nfor _name in ('Exception', 'RuntimeError', 'ValueError', 'TypeError', 'IndexError', 'KeyError', 'AssertionError'):\n    _safe_author_builtins[_name] = getattr(_builtins, _name)\n_user_code = {author_code.source!r}\n_output = io.StringIO()\ntry:\n    _prepare_private_scene({str(revision_path)!r})\n    with contextlib.redirect_stdout(_output):\n        exec(compile(_user_code, '<headless-bpy-program>', 'exec'), {{\n            '__name__': '__main__',\n            '__file__': '<headless-bpy-program>',\n            '__builtins__': _safe_author_builtins,\n        }})\n    _save_and_inspect({str(revision_path)!r})\n    _emit({{'scene_revision': {revision_number}, 'saved': True, 'inspected': True, 'stdout': _output.getvalue()}})\nexcept Exception as _exc:\n    _emit(error_code='ResultMalformed', error_message=str(_exc))\n    sys.exit(1)\n"""
     elif operation == "import_asset":
         if revision_path is None or asset_path is None or import_format is None:
             raise ValueError("import requires asset and revision paths")
@@ -865,7 +1116,7 @@ def build_provider_script(
             import_call = "bpy.ops.import_scene.fbx(filepath=_path)"
         else:
             import_call = "bpy.ops.wm.usd_import(filepath=_path)"
-        script += f"""_before = {{obj.name for obj in bpy.context.scene.objects}}\ntry:\n    _path = {str(asset_path)!r}\n    {import_call}\n    _names = [obj.name for obj in bpy.context.scene.objects if obj.name not in _before]\n    _save_and_inspect({str(revision_path)!r})\n    _emit({{'scene_revision': {revision_number}, 'imported_object_names': _names, 'format': {import_format.value!r}, 'saved': True, 'inspected': True}})\nexcept Exception as _exc:\n    _emit(error_code='ResultMalformed', error_message=str(_exc))\n    sys.exit(1)\n"""
+        script += f"""# Imported scenes are staged into the private next revision.\n_before = {{obj.name for obj in bpy.context.scene.objects}}\ntry:\n    _prepare_private_scene({str(revision_path)!r})\n    _path = {str(asset_path)!r}\n    {import_call}\n    _names = [obj.name for obj in bpy.context.scene.objects if obj.name not in _before]\n    _save_and_inspect({str(revision_path)!r})\n    _emit({{'scene_revision': {revision_number}, 'imported_object_names': _names, 'format': {import_format.value!r}, 'saved': True, 'inspected': True}})\nexcept Exception as _exc:\n    _emit(error_code='ResultMalformed', error_message=str(_exc))\n    sys.exit(1)\n"""
     elif operation == "camera_render_preview":
         if preview_path is None or preview_size is None:
             raise ValueError("preview requires output path and size")
@@ -937,12 +1188,27 @@ class SceneSession:
         self.approved_output_roots = _resolve_roots(
             approved_output_roots, "BLENDER_MCP_APPROVED_OUTPUT_ROOTS", ErrorCode.INVALID_OUTPUT_PATH
         )
-        self.workspace = workspace or Path(tempfile.mkdtemp(prefix="blender-headless-session-"))
-        self.workspace.mkdir(parents=True, exist_ok=True)
+        self._staged_capabilities: tuple[_DirectoryCapability, ...] = ()
+        self._approved_capabilities: tuple[_DirectoryCapability, ...] = ()
         try:
-            os.chmod(self.workspace, 0o700)
-        except OSError:
-            pass
+            self._staged_capabilities = _directory_capabilities(
+                self.staged_asset_roots, ErrorCode.INVALID_ASSET_PATH
+            )
+            self._approved_capabilities = _directory_capabilities(
+                self.approved_output_roots, ErrorCode.INVALID_OUTPUT_PATH
+            )
+            self.workspace = workspace or Path(tempfile.mkdtemp(prefix="blender-headless-session-"))
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(self.workspace, 0o700)
+            except OSError:
+                pass
+        except Exception:
+            # Root descriptors are capabilities.  Never leave an earlier root
+            # open when a later root or workspace setup fails.
+            for capability in (*self._staged_capabilities, *self._approved_capabilities):
+                capability.close()
+            raise
         self.revision = 0
         self.current_scene: Path | None = None
         self._lock = asyncio.Lock()
@@ -986,12 +1252,56 @@ class SceneSession:
                 raise ProviderError(ErrorCode.SCENE_NOT_INITIALIZED, "scene has no successful revision")
             self._active_task = asyncio.current_task()
             next_revision = self.revision + 1
+            operation_dir = self.workspace / f"operation-{uuid.uuid4().hex}"
+            operation_dir.mkdir(mode=0o700)
+            with suppress(OSError):
+                os.chmod(operation_dir, 0o700)
             revision_path = self.workspace / f"scene-{next_revision:08d}.blend" if mutation else None
-            temporary_revision = self.workspace / f".scene-{next_revision:08d}-{uuid.uuid4().hex}.blend" if mutation else None
-            preview_path = self.workspace / f"preview-{uuid.uuid4().hex}.png" if operation == "camera_render_preview" else None
-            script_path = self.workspace / f"operation-{uuid.uuid4().hex}.py"
-            published = False
+            temporary_revision = operation_dir / f".scene-{next_revision:08d}.blend" if mutation else None
+            preview_path = operation_dir / "preview.png" if operation == "camera_render_preview" else None
+            script_path = operation_dir / "provider.py"
+            scene_input_path = operation_dir / "input.blend" if self.current_scene is not None else None
+            private_asset_path = (
+                operation_dir / f"asset.{import_format.value}"
+                if asset_path is not None and import_format is not None
+                else None
+            )
+            private_output_path = (
+                operation_dir / f"export-output.{export_format.value}"
+                if output_path is not None and export_format is not None
+                else None
+            )
             try:
+                # Never expose the published predecessor to Blender.  The
+                # child receives an fd-based private copy, and mutation code
+                # is pointed at the private next-revision path below.
+                if scene_input_path is not None and self.current_scene is not None:
+                    try:
+                        source_fd = os.open(
+                            self.current_scene,
+                            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        )
+                    except OSError as exc:
+                        raise ProviderError(
+                            ErrorCode.SCENE_REVISION_MISSING,
+                            "current scene revision cannot be opened safely",
+                        ) from exc
+                    _copy_fd_to_path(source_fd, scene_input_path, ErrorCode.SCENE_REVISION_MISSING)
+                    with suppress(OSError):
+                        os.chmod(scene_input_path, 0o400)
+                if private_asset_path is not None and asset_path is not None:
+                    _copy_checked_file(
+                        asset_path,
+                        self._staged_capabilities,
+                        private_asset_path,
+                        ErrorCode.INVALID_ASSET_PATH,
+                    )
+                    with suppress(OSError):
+                        os.chmod(private_asset_path, 0o400)
+                if private_output_path is not None:
+                    # Exclusive creation is not needed here: Blender creates
+                    # the file, and the operation directory is private.
+                    private_output_path.unlink(missing_ok=True)
                 if mutation and temporary_revision is None:
                     raise AssertionError("mutation must have a temporary revision path")
                 if author_code is not None:
@@ -1002,9 +1312,9 @@ class SceneSession:
                     revision_number=next_revision if mutation else self.revision,
                     revision_path=temporary_revision,
                     author_code=author_code,
-                    asset_path=asset_path,
+                    asset_path=private_asset_path,
                     import_format=import_format,
-                    output_path=output_path,
+                    output_path=private_output_path,
                     export_format=export_format,
                     selection_only=selection_only,
                     preview_path=preview_path,
@@ -1012,27 +1322,18 @@ class SceneSession:
                 )
                 script_path.write_text(script, encoding="utf-8")
                 os.chmod(script_path, 0o600)
-                if preview_path is not None and preview_path.exists():
-                    preview_path.unlink()
                 command = plan_strict_command(
                     self.blender_executable,
-                    self.current_scene,
+                    scene_input_path,
                     script_path,
                     (operation,),
                 )
-                if operation == "export_scene" and output_path is not None and output_path.exists():
-                    # Never let stale output masquerade as this invocation's
-                    # export.  The path was canonicalized and checked above.
-                    try:
-                        output_path.unlink()
-                    except OSError as exc:
-                        raise ProviderError(ErrorCode.INVALID_OUTPUT_PATH, f"cannot remove stale export: {output_path}") from exc
                 try:
                     observation = await self.executor.execute(
                         command,
                         timeout=self.timeout_seconds,
                         execute_code=operation == "execute_code",
-                        cwd=self.workspace,
+                        cwd=operation_dir,
                     )
                 except StrictExecutionError as exc:
                     code = {
@@ -1041,6 +1342,7 @@ class SceneSession:
                         StrictFailureKind.TIMED_OUT: ErrorCode.BLENDER_TIMED_OUT,
                         StrictFailureKind.CANCELLED: ErrorCode.BLENDER_CANCELLED,
                         StrictFailureKind.SPAWN_FAILED: ErrorCode.BLENDER_EXECUTABLE_MISSING,
+                        StrictFailureKind.REAP_FAILED: ErrorCode.BLENDER_LIFECYCLE_FAILURE,
                     }[exc.kind]
                     raise ProviderError(code, str(exc)) from exc
                 except TimeoutError as exc:
@@ -1086,37 +1388,44 @@ class SceneSession:
                     if revision_path is None:
                         raise ProviderError(ErrorCode.SCENE_REVISION_MISSING, "revision publication path is missing")
                     os.replace(temporary_revision, revision_path)
-                    published = True
+                    with suppress(OSError):
+                        os.chmod(revision_path, 0o400)
                     self.revision = next_revision
                     self.current_scene = revision_path
                     return checked_result
                 if operation == "camera_render_preview":
                     if data != {"preview": True}:
                         raise ProviderError(ErrorCode.RESULT_MALFORMED, "preview result is invalid")
-                    if preview_path is None or not preview_path.is_file() or preview_path.stat().st_size <= 0:
-                        raise ProviderError(ErrorCode.PREVIEW_MISSING, "Blender did not produce a PNG preview")
+                    if preview_path is None:
+                        raise ProviderError(ErrorCode.PREVIEW_MISSING, "preview output path is missing")
+                    _private_file_size(preview_path, ErrorCode.PREVIEW_MISSING)
                     preview = preview_path.read_bytes()
                     _validate_png(preview, preview_size.pixels if preview_size is not None else 0)
                     return {"png": preview}
                 if operation == "export_scene":
-                    if output_path is None or export_format is None:
+                    if output_path is None or export_format is None or private_output_path is None:
                         raise ProviderError(ErrorCode.RESULT_MALFORMED, "export request metadata is missing")
-                    _parse_export_result(data, self.revision, output_path, export_format)
-                    if not output_path.is_file() or output_path.stat().st_size <= 0:
-                        raise ProviderError(ErrorCode.EXPORT_MISSING, "Blender did not produce a non-empty export")
+                    _parse_export_result(data, self.revision, private_output_path, export_format)
+                    bytes_written = _publish_private_file(
+                        private_output_path,
+                        output_path,
+                        self._approved_capabilities,
+                        ErrorCode.INVALID_OUTPUT_PATH,
+                    )
                     return {
                         "scene_revision": self.revision,
                         "path": str(output_path),
                         "format": export_format.value,
-                        "bytes": output_path.stat().st_size,
+                        "bytes": bytes_written,
                     }
                 raise ProviderError(ErrorCode.RESULT_MALFORMED, "unknown session operation")
             finally:
-                script_path.unlink(missing_ok=True)
-                if temporary_revision is not None and not published:
-                    temporary_revision.unlink(missing_ok=True)
-                if preview_path is not None:
-                    preview_path.unlink(missing_ok=True)
+                # A hard lifecycle failure deliberately retains ownership and
+                # the operation directory so teardown can retry reaping before
+                # removing evidence or workspace bytes.
+                if self.active_process is None:
+                    with suppress(OSError):
+                        shutil.rmtree(operation_dir)
                 self._active_task = None
 
     async def get_scene_info(self) -> dict[str, Any]:
@@ -1161,32 +1470,59 @@ class SceneSession:
         )
 
     async def teardown(self) -> None:
-        """Cancel active work, reap its child, and remove the private workspace."""
+        """Reap owned work before releasing descriptors or the workspace."""
         async with self._teardown_lock:
             if self._teardown_complete:
                 return
             self._closed = True
-            try:
-                task = self._active_task
-                if task is not None and task is not asyncio.current_task() and not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except (ProviderError, asyncio.CancelledError):
-                        pass
-            finally:
+            lifecycle_error: StrictExecutionError | None = None
+            task = self._active_task
+            if task is not None and task is not asyncio.current_task() and not task.done():
+                task.cancel()
                 try:
-                    active = self.active_process
-                    if active is not None and active.returncode is None:
-                        reap = getattr(self.executor, "_terminate_and_reap", None)
-                        if reap is not None:
-                            await reap(active)
-                finally:
+                    await _await_uninterruptibly(task)
+                except (ProviderError, asyncio.CancelledError):
+                    pass
+                except StrictExecutionError as exc:
+                    lifecycle_error = exc
+
+            active = self.active_process
+            if active is not None:
+                reap = getattr(self.executor, "_terminate_and_reap", None)
+                if not callable(reap):
+                    lifecycle_error = lifecycle_error or StrictExecutionError(
+                        StrictFailureKind.REAP_FAILED,
+                        "active Blender child has no reap capability",
+                    )
+                else:
                     try:
-                        shutil.rmtree(self.workspace)
-                    except FileNotFoundError:
-                        pass
-                    self._teardown_complete = True
+                        await _await_uninterruptibly(reap(active))
+                    except StrictExecutionError as exc:
+                        lifecycle_error = lifecycle_error or exc
+                    else:
+                        # _terminate_and_reap is also used by the session
+                        # bracket; teardown owns the final clear because it
+                        # called the helper outside that bracket.
+                        if active.returncode is not None:
+                            self.executor.active_process = None
+
+            if self.active_process is not None:
+                lifecycle_error = lifecycle_error or StrictExecutionError(
+                    StrictFailureKind.REAP_FAILED,
+                    "Blender child ownership could not be safely released",
+                )
+            if lifecycle_error is not None:
+                # Keep descriptors, operation bytes, and ownership for a later
+                # retry.  Claiming teardown success here would leak a child.
+                raise lifecycle_error
+
+            for capability in (*self._staged_capabilities, *self._approved_capabilities):
+                capability.close()
+            try:
+                shutil.rmtree(self.workspace)
+            except FileNotFoundError:
+                pass
+            self._teardown_complete = True
 
     async def close(self) -> None:
         """Alias for teardown used by embedding hosts."""

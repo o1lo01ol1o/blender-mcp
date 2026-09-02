@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 from pathlib import Path
 
@@ -14,11 +15,14 @@ from blender_mcp.headless_session import (
     WIRE_VERSION,
     ErrorCode,
     ExportFormat,
+    ImportFormat,
     ProviderError,
     SceneSession,
+    _directory_capabilities,
     _parse_execute_result,
     _parse_scene_info,
     _parse_sentinel,
+    _safe_dirfd_operations_available,
     admit_headless_bpy_program,
     build_provider_script,
     decode_request,
@@ -209,6 +213,54 @@ def test_paths_are_root_contained_and_fail_closed(tmp_path: Path):
     assert caught.value.code is ErrorCode.INVALID_OUTPUT_PATH
 
 
+def test_constructor_fails_closed_without_safe_dirfd_operations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    monkeypatch.setattr(os, "supports_dir_fd", set())
+    assert _safe_dirfd_operations_available() is False
+    with pytest.raises(ProviderError) as caught:
+        SceneSession(
+            "/fake/blender",
+            workspace=tmp_path / "session",
+            executor=FakeExecutor(),
+            staged_asset_roots=[staged],
+        )
+    assert caught.value.code is ErrorCode.INVALID_ASSET_PATH
+
+
+def test_constructor_closes_opened_root_descriptors_on_partial_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    staged = tmp_path / "staged"
+    approved = tmp_path / "approved"
+    staged.mkdir()
+    approved.mkdir()
+    real_directory_capabilities = _directory_capabilities
+    opened = []
+
+    def open_capabilities(roots, error):
+        if not opened:
+            capabilities = real_directory_capabilities(roots, error)
+            opened.extend(capabilities)
+            return capabilities
+        raise ProviderError(error, "simulated later root failure")
+
+    monkeypatch.setattr(
+        "blender_mcp.headless_session._directory_capabilities", open_capabilities
+    )
+    with pytest.raises(ProviderError, match="simulated later root failure"):
+        SceneSession(
+            "/fake/blender",
+            workspace=tmp_path / "session",
+            executor=FakeExecutor(),
+            staged_asset_roots=[staged],
+            approved_output_roots=[approved],
+        )
+    assert opened and all(capability.fd is None for capability in opened)
+
+
 def test_checked_formats_and_preview_bounds():
     assert parse_import_format("glb").value == "glb"
     assert parse_export_format("blend").value == "blend"
@@ -289,6 +341,206 @@ async def test_failed_spawn_cleans_operation_and_temporary_revision_files(tmp_pa
         await session.execute_code("print('never ran')")
     assert caught.value.code is ErrorCode.BLENDER_EXECUTABLE_MISSING
     assert list(session.workspace.iterdir()) == []
+    await session.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_import_uses_open_source_descriptor_after_path_admission(tmp_path: Path):
+    staged = tmp_path / "staged"
+    outside = tmp_path / "outside"
+    staged.mkdir()
+    outside.mkdir()
+    asset = staged / "asset.glb"
+    asset.write_bytes(b"glTF")
+    outside_asset = outside / "asset.glb"
+    outside_asset.write_bytes(b"outside")
+    session = SceneSession(
+        "/fake/blender",
+        workspace=tmp_path / "session",
+        executor=FakeExecutor(),
+        staged_asset_roots=[staged],
+    )
+    admitted = parse_asset_path(str(asset), [staged])
+    asset.unlink()
+    asset.symlink_to(outside_asset)
+    with pytest.raises(ProviderError) as caught:
+        await session._run("import_asset", mutation=True, asset_path=admitted, import_format=ImportFormat.GLB)
+    assert caught.value.code is ErrorCode.INVALID_ASSET_PATH
+    assert session.executor.commands == []
+    await session.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_export_publishes_through_held_parent_descriptor_after_path_admission(tmp_path: Path):
+    approved = tmp_path / "approved"
+    nested = approved / "nested"
+    outside = tmp_path / "outside"
+    approved.mkdir()
+    nested.mkdir()
+    outside.mkdir()
+    destination = nested / "scene.blend"
+    admitted = parse_export_scene_request(str(destination), "blend", False, [approved]).path
+    class ExportExecutor(FakeExecutor):
+        async def execute(self, command, *, timeout, execute_code, cwd):
+            if execute_code:
+                return await super().execute(
+                    command, timeout=timeout, execute_code=execute_code, cwd=cwd
+                )
+            self.commands.append((command, execute_code, cwd))
+            script = Path(command.argv[command.argv.index("--python") + 1]).read_text()
+            target = Path(re.search(r"_path = '([^']+)'", script).group(1))
+            target.write_bytes(b"private-export")
+            payload = {
+                "wire_version": WIRE_VERSION,
+                "ok": True,
+                "data": {"scene_revision": 1, "path": str(target), "format": "blend"},
+            }
+            return RawBlenderObservation(0, SENTINEL_PREFIX + json.dumps(payload), "")
+
+    session = SceneSession(
+        "/fake/blender",
+        workspace=tmp_path / "session",
+        executor=ExportExecutor(),
+        approved_output_roots=[approved],
+    )
+    nested.rename(approved / "nested-real")
+    nested.symlink_to(outside, target_is_directory=True)
+    await session.execute_code("print('one')")
+    with pytest.raises(ProviderError) as caught:
+        await session._run(
+            "export_scene",
+            output_path=admitted,
+            export_format=ExportFormat.BLEND,
+        )
+    assert caught.value.code is ErrorCode.INVALID_OUTPUT_PATH
+    assert not (outside / "scene.blend").exists()
+    await session.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_export_rejects_parent_swap_after_descriptor_acquisition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    approved = tmp_path / "approved"
+    nested = approved / "nested"
+    outside = tmp_path / "outside"
+    approved.mkdir()
+    nested.mkdir()
+    outside.mkdir()
+    destination = nested / "scene.blend"
+    admitted = parse_export_scene_request(str(destination), "blend", False, [approved]).path
+
+    class ExportExecutor(FakeExecutor):
+        async def execute(self, command, *, timeout, execute_code, cwd):
+            if execute_code:
+                return await super().execute(
+                    command, timeout=timeout, execute_code=execute_code, cwd=cwd
+                )
+            self.commands.append((command, execute_code, cwd))
+            script = Path(command.argv[command.argv.index("--python") + 1]).read_text()
+            target = Path(re.search(r"_path = '([^']+)'", script).group(1))
+            target.write_bytes(b"private-export")
+            payload = {
+                "wire_version": WIRE_VERSION,
+                "ok": True,
+                "data": {"scene_revision": 1, "path": str(target), "format": "blend"},
+            }
+            return RawBlenderObservation(0, SENTINEL_PREFIX + json.dumps(payload), "")
+
+    executor = ExportExecutor()
+    session = SceneSession(
+        "/fake/blender",
+        workspace=tmp_path / "session",
+        executor=executor,
+        approved_output_roots=[approved],
+    )
+    await session.execute_code("print('one')")
+    real_rename = os.rename
+    swapped = False
+
+    def swap_before_rename(source, target, *, src_dir_fd=None, dst_dir_fd=None):
+        nonlocal swapped
+        if target == "scene.blend" and not swapped:
+            swapped = True
+            real_rename(nested, approved / "nested-real")
+            nested.symlink_to(outside, target_is_directory=True)
+        return real_rename(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "rename", swap_before_rename)
+    with pytest.raises(ProviderError) as caught:
+        await session._run(
+            "export_scene",
+            output_path=admitted,
+            export_format=ExportFormat.BLEND,
+        )
+    assert caught.value.code is ErrorCode.INVALID_OUTPUT_PATH
+    assert not (outside / "scene.blend").exists()
+    await session.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_export_rejects_same_size_destination_substitution_after_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    destination = approved / "scene.blend"
+    substitute = approved / "substitute.blend"
+    exported_content = b"exported!"
+    attacker_content = b"attacker?"
+    substitute.write_bytes(attacker_content)
+    admitted = parse_export_scene_request(str(destination), "blend", False, [approved]).path
+
+    class ExportExecutor(FakeExecutor):
+        async def execute(self, command, *, timeout, execute_code, cwd):
+            if execute_code:
+                return await super().execute(
+                    command, timeout=timeout, execute_code=execute_code, cwd=cwd
+                )
+            self.commands.append((command, execute_code, cwd))
+            script = Path(command.argv[command.argv.index("--python") + 1]).read_text()
+            target = Path(re.search(r"_path = '([^']+)'", script).group(1))
+            target.write_bytes(exported_content)
+            payload = {
+                "wire_version": WIRE_VERSION,
+                "ok": True,
+                "data": {"scene_revision": 1, "path": str(target), "format": "blend"},
+            }
+            return RawBlenderObservation(0, SENTINEL_PREFIX + json.dumps(payload), "")
+
+    executor = ExportExecutor()
+    session = SceneSession(
+        "/fake/blender",
+        workspace=tmp_path / "session",
+        executor=executor,
+        approved_output_roots=[approved],
+    )
+    await session.execute_code("print('one')")
+    real_rename = os.rename
+    substituted = False
+
+    def substitute_after_rename(source, target, *, src_dir_fd=None, dst_dir_fd=None):
+        nonlocal substituted
+        result = real_rename(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        if target == "scene.blend" and not substituted:
+            substituted = True
+            real_rename(substitute, destination)
+        return result
+
+    monkeypatch.setattr(os, "rename", substitute_after_rename)
+    with pytest.raises(ProviderError) as caught:
+        await session._run(
+            "export_scene",
+            output_path=admitted,
+            export_format=ExportFormat.BLEND,
+        )
+    assert caught.value.code is ErrorCode.INVALID_OUTPUT_PATH
+    assert destination.read_bytes() == attacker_content
+    assert not substitute.exists()
     await session.teardown()
 
 
@@ -530,6 +782,111 @@ async def test_descendants_are_captured_and_reaped_after_parent_exit(tmp_path: P
 
 @pytest.mark.asyncio
 @pytest.mark.unit
+async def test_process_group_reaps_immediate_orphan_before_descendant_poll(tmp_path: Path):
+    executable = tmp_path / "fake-blender"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import os, time; os.close(1); os.close(2); time.sleep(30)'])\n"
+        "with open('child.pid', 'w') as stream:\n"
+        "    stream.write(str(child.pid))\n"
+        "os._exit(0)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(executable.stat().st_mode | 0o111)
+    script = tmp_path / "op.py"
+    script.write_text("", encoding="utf-8")
+
+    class AllowGuard:
+        def available(self):
+            return True
+
+        def wrap(self, argv):
+            return argv
+
+    executor = StrictBlenderExecutor(str(executable), process_guard=AllowGuard(), reap_grace_seconds=0.2)
+
+    async def no_descendant_poll(*args, **kwargs):
+        return
+
+    executor._track_descendants = no_descendant_poll
+    command = plan_strict_command(str(executable), None, script)
+    result = await executor.execute(command, timeout=5, cwd=tmp_path, execute_code=True)
+    assert result.returncode == 0
+    child_pid = int((tmp_path / "child.pid").read_text())
+    assert not psutil.pid_exists(child_pid)
+    assert executor.active_process is None
+    assert executor.active_process_group_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_descendant_ownership_survives_failed_reap_until_teardown_retry(tmp_path: Path):
+    executable = tmp_path / "fake-blender"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(executable.stat().st_mode | 0o111)
+
+    class AllowGuard:
+        def available(self):
+            return True
+
+        def wrap(self, argv):
+            return argv
+
+    executor = StrictBlenderExecutor(str(executable), process_guard=AllowGuard(), reap_grace_seconds=0.05)
+    session = SceneSession(
+        str(executable), workspace=tmp_path / "session", executor=executor, timeout_seconds=30
+    )
+    original_reap = executor._reap_captured
+    failures = [4]
+
+    async def fail_first_reaps(captured, *, force):
+        if failures[0] and captured:
+            failures[0] -= 1
+            raise StrictExecutionError(StrictFailureKind.REAP_FAILED, "adversarial reap failure")
+        return await original_reap(captured, force=force)
+
+    executor._reap_captured = fail_first_reaps
+    operation = asyncio.create_task(session.execute_code("print('active')"))
+    try:
+        deadline = asyncio.get_running_loop().time() + 10
+        while (
+            (executor.active_process is None or not executor.active_descendants)
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        assert executor.active_process is not None
+        descendant_pids = set(executor.active_descendants)
+        assert descendant_pids
+        operation.cancel()
+        with pytest.raises(ProviderError) as caught:
+            await operation
+        assert caught.value.code is ErrorCode.BLENDER_LIFECYCLE_FAILURE
+        assert set(executor.active_descendants) == descendant_pids
+        # Group cleanup may already have signalled the OS process; the
+        # invariant is that captured handles survive the failed bracket and
+        # remain available to teardown retry.
+        # The first operation failed hard, but teardown can retry using the
+        # executor-owned descendant handles rather than a discarded local map.
+        executor._reap_captured = original_reap
+        await session.teardown()
+        assert executor.active_process is None
+        assert all(not psutil.pid_exists(pid) for pid in descendant_pids)
+    finally:
+        executor._reap_captured = original_reap
+        if not session._teardown_complete:
+            await session.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
 async def test_session_cancellation_preserves_existing_revision(tmp_path: Path):
     executable = tmp_path / "fake-blender"
     executable.write_text(
@@ -586,6 +943,51 @@ async def test_session_cancellation_preserves_existing_revision(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.unit
+async def test_hard_reap_failure_retains_executor_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    executable = tmp_path / "fake-blender"
+    script = tmp_path / "op.py"
+    executable.write_text("", encoding="utf-8")
+    script.write_text("", encoding="utf-8")
+
+    class HostileProcess:
+        pid = 99_999_991
+        returncode = None
+
+        async def communicate(self):
+            raise TimeoutError
+
+        async def wait(self):
+            raise TimeoutError
+
+    process = HostileProcess()
+
+    async def spawn(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    class NoGuard:
+        def available(self):
+            return False
+
+    executor = StrictBlenderExecutor(str(executable), process_guard=NoGuard(), reap_grace_seconds=0.01)
+
+    async def hostile_reap(*args, **kwargs):
+        raise StrictExecutionError(StrictFailureKind.REAP_FAILED, "hostile child did not reap")
+
+    monkeypatch.setattr(executor, "_terminate_and_reap", hostile_reap)
+    command = plan_strict_command(str(executable), None, script)
+    with pytest.raises(StrictExecutionError) as caught:
+        await executor.execute(command, timeout=0.01)
+    assert caught.value.kind is StrictFailureKind.REAP_FAILED
+    assert executor.active_process is process
+    executor.active_process = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
 async def test_timeout_and_cancellation_reap_the_direct_child(tmp_path: Path):
     executable = tmp_path / "fake-blender"
     executable.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n", encoding="utf-8")
@@ -613,6 +1015,49 @@ async def test_timeout_and_cancellation_reap_the_direct_child(tmp_path: Path):
         await task
     assert cancelled.value.kind is StrictFailureKind.CANCELLED
     assert executor.active_process is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_reap_bracket_survives_repeated_cancellation(tmp_path: Path):
+    executable = tmp_path / "fake-blender"
+    executable.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n", encoding="utf-8")
+    executable.chmod(executable.stat().st_mode | 0o111)
+    script = tmp_path / "op.py"
+    script.write_text("", encoding="utf-8")
+
+    class NoGuard:
+        def available(self):
+            return False
+
+    executor = StrictBlenderExecutor(str(executable), process_guard=NoGuard(), reap_grace_seconds=0.1)
+    original_reap = executor._terminate_and_reap
+    reap_started = asyncio.Event()
+    release_reap = asyncio.Event()
+
+    async def delayed_reap(*args, **kwargs):
+        reap_started.set()
+        await release_reap.wait()
+        return await original_reap(*args, **kwargs)
+
+    executor._terminate_and_reap = delayed_reap
+    command = plan_strict_command(str(executable), None, script)
+    operation = asyncio.create_task(executor.execute(command, timeout=30))
+    try:
+        while executor.active_process is None:
+            await asyncio.sleep(0)
+        operation.cancel()
+        await reap_started.wait()
+        operation.cancel()
+        release_reap.set()
+        with pytest.raises(StrictExecutionError) as caught:
+            await operation
+        assert caught.value.kind is StrictFailureKind.CANCELLED
+        assert executor.active_process is None
+    finally:
+        executor._terminate_and_reap = original_reap
+        if executor.active_process is not None:
+            await original_reap(executor.active_process)
 
 
 @pytest.mark.asyncio
@@ -649,6 +1094,9 @@ async def test_cancellation_during_spawn_publishes_then_reaps_handle(
     command = plan_strict_command(str(executable), None, script)
     task = asyncio.create_task(executor.execute(command, timeout=30))
     await spawned.wait()
+    task.cancel()
+    # A second cancellation while ownership is being transferred must not
+    # interrupt the shielded spawn/reap bracket.
     task.cancel()
     release_spawn.set()
     with pytest.raises(StrictExecutionError, match="cancelled during spawn") as cancelled:
