@@ -1173,7 +1173,11 @@ class SceneSession:
                 not self.blender_executable
                 or not executable.is_file()
                 or not os.access(executable, os.X_OK)
-                or not strict_executor.validate_executable()
+                # Startup validation shares the session's bounded operation
+                # timeout.  Under host contention this can increase startup
+                # latency, but avoids rejecting a valid Blender solely because
+                # its launch exceeded the executor's shorter default probe.
+                or not strict_executor.validate_executable(timeout=timeout_seconds)
             ):
                 raise ProviderError(
                     ErrorCode.BLENDER_EXECUTABLE_MISSING,

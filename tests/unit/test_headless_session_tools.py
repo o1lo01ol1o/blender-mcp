@@ -30,6 +30,32 @@ def test_non_blender_executable_fails_before_workspace_creation(tmp_path: Path):
     assert not workspace.exists()
 
 
+def test_executable_validation_uses_session_timeout_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    executable = tmp_path / "blender"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    workspace = tmp_path / "must-not-exist"
+    observed_timeouts: list[float] = []
+
+    class RejectingExecutor:
+        def __init__(self, _executable: str, *, audit_path=None):
+            self.active_process = None
+
+        def validate_executable(self, *, timeout: float) -> bool:
+            observed_timeouts.append(timeout)
+            return False
+
+    monkeypatch.setattr("blender_mcp.headless_session.StrictBlenderExecutor", RejectingExecutor)
+    with pytest.raises(ProviderError) as caught:
+        SceneSession(str(executable), workspace=workspace, timeout_seconds=37)
+
+    assert caught.value.code is ErrorCode.BLENDER_EXECUTABLE_MISSING
+    assert observed_timeouts == [37]
+    assert not workspace.exists()
+
+
 @pytest.mark.asyncio
 @pytest.mark.unit
 async def test_headless_entry_point_exposes_exactly_five_tools(tmp_path: Path):
