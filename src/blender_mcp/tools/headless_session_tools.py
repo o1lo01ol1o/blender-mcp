@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import Annotated, Any, TypeVar
 
 from fastmcp.utilities.types import Image
+from pydantic import Field
 
 from blender_mcp.headless_session import (
     ErrorCode,
+    ExportFormat,
+    ImportFormat,
     ProviderError,
     SceneSession,
     check_public_result,
@@ -27,6 +30,9 @@ _MUTATING = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": 
 _EXPORT = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False}
 
 T = TypeVar("T")
+StrictText = Annotated[str, Field(strict=True)]
+PreviewPixels = Annotated[int, Field(strict=True, ge=64, le=2048)]
+StrictBoolean = Annotated[bool, Field(strict=True)]
 
 
 def _error_result(error: ProviderError) -> dict[str, Any]:
@@ -62,7 +68,7 @@ def register_headless_session_tools(app: Any, session: SceneSession) -> None:
         return result  # type: ignore[return-value]
 
     @app.tool(name="blender_execute_code", annotations=_MUTATING)
-    async def blender_execute_code(code: Any) -> dict[str, Any]:
+    async def blender_execute_code(code: StrictText) -> dict[str, Any]:
         try:
             request = parse_execute_code_request(code)
         except ProviderError as exc:
@@ -73,7 +79,9 @@ def register_headless_session_tools(app: Any, session: SceneSession) -> None:
         return result  # type: ignore[return-value]
 
     @app.tool(name="blender_camera_render_preview", annotations=_READ_ONLY)
-    async def blender_camera_render_preview(max_size: Any) -> Image | dict[str, Any]:
+    async def blender_camera_render_preview(
+        max_size: PreviewPixels,
+    ) -> Image | dict[str, Any]:
         try:
             request = parse_camera_render_preview_request(max_size)
         except ProviderError as exc:
@@ -90,7 +98,7 @@ def register_headless_session_tools(app: Any, session: SceneSession) -> None:
         return Image(data=result, format="png")
 
     @app.tool(name="blender_import_asset", annotations=_MUTATING)
-    async def blender_import_asset(path: Any, format: Any) -> dict[str, Any]:
+    async def blender_import_asset(path: StrictText, format: ImportFormat) -> dict[str, Any]:
         try:
             request = parse_import_asset_request(path, format, session.staged_asset_roots)
         except ProviderError as exc:
@@ -101,7 +109,9 @@ def register_headless_session_tools(app: Any, session: SceneSession) -> None:
         return result  # type: ignore[return-value]
 
     @app.tool(name="blender_export_scene", annotations=_EXPORT)
-    async def blender_export_scene(path: Any, format: Any, selection_only: Any = False) -> dict[str, Any]:
+    async def blender_export_scene(
+        path: StrictText, format: ExportFormat, selection_only: StrictBoolean
+    ) -> dict[str, Any]:
         try:
             request = parse_export_scene_request(
                 path, format, selection_only, session.approved_output_roots

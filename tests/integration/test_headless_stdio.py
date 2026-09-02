@@ -94,6 +94,12 @@ async def test_headless_stdio_initializes_and_lists_only_compatibility_tools():
         "blender_import_asset",
         "blender_export_scene",
     ]
+    schema_golden = (
+        root / "tests/golden/blender_headless_session_v1/tools-list.input-schemas.json"
+    )
+    assert {tool.name: tool.inputSchema for tool in tools} == json.loads(
+        schema_golden.read_text()
+    )
 
 
 def test_headless_stdio_missing_explicit_blender_fails_clearly():

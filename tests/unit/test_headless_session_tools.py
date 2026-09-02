@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from fastmcp.exceptions import ValidationError as FastMCPValidationError
 
 from blender_mcp.headless_server import create_headless_server
 from blender_mcp.headless_session import ErrorCode, ProviderError, SceneSession
@@ -34,14 +35,22 @@ def test_non_blender_executable_fails_before_workspace_creation(tmp_path: Path):
 async def test_headless_entry_point_exposes_exactly_five_tools(tmp_path: Path):
     session = SceneSession("/fake/blender", workspace=tmp_path / "session", executor=object())
     app = create_headless_server(session=session)
-    assert [tool.name for tool in await app.list_tools()] == [
+    listed_tools = await app.list_tools()
+    assert [tool.name for tool in listed_tools] == [
         "blender_get_scene_info",
         "blender_execute_code",
         "blender_camera_render_preview",
         "blender_import_asset",
         "blender_export_scene",
     ]
-    tools = {tool.name: tool for tool in await app.list_tools()}
+    schema_golden = (
+        Path(__file__).parents[1]
+        / "golden/blender_headless_session_v1/tools-list.input-schemas.json"
+    )
+    assert {tool.name: tool.parameters for tool in listed_tools} == json.loads(
+        schema_golden.read_text()
+    )
+    tools = {tool.name: tool for tool in listed_tools}
     assert tools["blender_export_scene"].annotations.readOnlyHint is False
     assert tools["blender_export_scene"].annotations.destructiveHint is True
     await session.teardown()
@@ -82,21 +91,28 @@ async def test_all_invalid_boundaries_skip_the_executor(tmp_path: Path):
         approved_output_roots=[approved],
     )
     app = create_headless_server(session=session)
-    invalid = [
+    provider_invalid = [
         ("blender_execute_code", {"code": "import builtins; builtins.__import__('os')"}),
+        ("blender_import_asset", {"path": str(staged / "missing.glb"), "format": "glb"}),
+        ("blender_export_scene", {"path": str(tmp_path / "outside.blend"), "format": "blend", "selection_only": False}),
+    ]
+    for name, arguments in provider_invalid:
+        result = await app.call_tool(name, arguments)
+        assert result.content and json.loads(result.content[0].text)["error"]["code"]
+
+    schema_invalid = [
         ("blender_execute_code", {"code": 123}),
         ("blender_camera_render_preview", {"max_size": 63}),
         ("blender_camera_render_preview", {"max_size": True}),
         ("blender_camera_render_preview", {"max_size": 2049}),
-        ("blender_import_asset", {"path": str(staged / "missing.glb"), "format": "glb"}),
         ("blender_import_asset", {"path": str(staged / "missing.glb"), "format": "blend"}),
-        ("blender_export_scene", {"path": str(tmp_path / "outside.blend"), "format": "blend"}),
-        ("blender_export_scene", {"path": str(approved / "scene.blend"), "format": "bad"}),
+        ("blender_export_scene", {"path": str(approved / "scene.blend"), "format": "bad", "selection_only": False}),
         ("blender_export_scene", {"path": str(approved / "scene.blend"), "format": "blend", "selection_only": "no"}),
+        ("blender_export_scene", {"path": str(approved / "scene.blend"), "format": "blend"}),
     ]
-    for name, arguments in invalid:
-        result = await app.call_tool(name, arguments)
-        assert result.content and json.loads(result.content[0].text)["error"]["code"]
+    for name, arguments in schema_invalid:
+        with pytest.raises(FastMCPValidationError):
+            await app.call_tool(name, arguments)
     assert executor.calls == 0
     await session.teardown()
 
