@@ -140,8 +140,16 @@ Request:
 { "code": "import bpy\n..." }
 ```
 
-The boundary parses `code` as a non-empty bounded `BpyProgram`. The provider
-then constructs, rather than accepts from the caller, the wrapper that loads
+The boundary parses `code` as a non-empty bounded `HeadlessBpyProgram`. In
+addition to syntax parsing, this prototype boundary rejects process-launch,
+dynamic-code-loading, display/window, and Xvfb access (`os`, `subprocess`,
+`multiprocessing`, `ctypes`, `socket`, dynamic import/eval/exec/compile, and
+window-manager creation APIs). The provider repeats this check even when the
+poly client has already admitted the program. This is the narrow invariant
+needed by the headless prototype, not a claim to provide a general Python
+security sandbox.
+
+The provider then constructs, rather than accepts from the caller, the wrapper that loads
 the current scene when present, executes the program, saves the next scene
 revision, and emits the result sentinel.
 
@@ -168,15 +176,15 @@ Request:
 ```
 
 `max_size` parses into a checked bounded preview size. The supported range is
-128–2048 pixels. The renderer preserves aspect ratio and constrains the
-largest output dimension to `max_size`.
+64–2048 pixels, matching the poly-org `PreviewSize` boundary. The renderer
+preserves aspect ratio and constrains the largest output dimension to
+`max_size`.
 
 The operation loads the current scene, requires an active camera, renders one
-PNG in background mode, and returns MCP content containing:
-
-1. a structured text item with scene revision, width, height, camera name,
-   frame, and media type; and
-2. an image item containing base64 PNG bytes with MIME type `image/png`.
+PNG in background mode, and returns exactly one MCP image content item with
+base64 PNG bytes and MIME type `image/png`. Revision/camera metadata is read
+through `blender_get_scene_info`; adding a text content item here would violate
+the client’s single-image result type.
 
 It does not capture a viewport and does not advance the scene revision.
 Missing camera and invalid render output are distinct typed errors.
@@ -315,10 +323,15 @@ compatibility tools are forbidden. The planner's checked type does not expose
 a GUI/headless boolean: prototype commands have only the strict-headless
 form.
 
-The generated operation script is provider-owned. User code is data embedded
-between provider-controlled load/result/save phases. The script emits one
-unique, versioned sentinel record so incidental Blender logging cannot be
-mistaken for the result.
+The generated operation script is provider-owned. Checked author code is data
+embedded between provider-controlled load/result/save phases. For
+`blender_execute_code`, the host launcher additionally denies descendant
+process creation (on the accepted macOS host, by a tested process policy such
+as a `sandbox-exec` profile); if that guard is unavailable, the execute-code
+tool fails closed. Thus admitted code cannot start another Blender or Xvfb
+process outside the canonical planner. The script emits one unique, versioned
+sentinel record so incidental Blender logging cannot be mistaken for the
+result.
 
 ## 6. Stdio initialization
 
@@ -358,6 +371,11 @@ No detached child, shell-mediated background process, or global Blender
 process is permitted. Tests inspect the process handle and workspace after
 normal completion, failure, cancellation, and server shutdown.
 
+This direct-child ownership and reaping is baseline resource correctness and
+is mandatory in B1. “Lifecycle hardening” deferred by the global plan means
+production policy—multi-tenant quotas, service restart recovery, tuned grace
+periods, and remote supervision—not permission to leak a prototype child.
+
 ## 8. Files in scope
 
 Expected implementation locations are:
@@ -389,8 +407,11 @@ the prototype compatibility entry point does not register it in addition to
   `--background` and `--factory-startup`.
 - No prototype source or argv contains Xvfb, a viewport capture, or a GUI-mode
   switch.
-- Empty code, out-of-range preview size, unsupported formats, and invalid paths
-  fail in the boundary parser before Blender is invoked.
+- Empty code, forbidden process/display constructs, out-of-range preview size,
+  unsupported formats, and invalid paths fail in the boundary parser before
+  Blender is invoked.
+- Execute-code fails closed when the descendant-process guard is unavailable;
+  a negative test attempts a process launch and proves it cannot start.
 - Request/result v1 goldens round-trip.
 - A failed mutation preserves the preceding scene revision.
 - Cancellation and timeout reap the child and do not publish a revision.
@@ -411,9 +432,10 @@ Using the explicit macOS Blender executable:
    Blender process.
 7. Shut down MCP and prove no Blender child or session workspace remains.
 
-The test records process argv and fails if any Blender process lacks
-`--background --factory-startup`. During the test there must be no Blender UI
-process, Blender window, viewport capture, or Xvfb process.
+The test records the entire provider descendant process tree and fails if any
+Blender process lacks `--background --factory-startup` or any unexpected child
+process appears. During the test there must be no Blender UI process, Blender
+window, viewport capture, or Xvfb process.
 
 Run the repository suite as well:
 
@@ -425,8 +447,9 @@ uv run pytest tests/ -q
 
 This prototype MR deliberately does not solve:
 
-- arbitrary-code security or sandboxing;
-- a production allowlist for `bpy` operations;
+- adversarial Python sandboxing beyond the mandatory prototype admission check
+  and descendant-process denial;
+- a production-complete allowlist for `bpy` operations;
 - retry policy for mutating scripts;
 - timeout policy tuning beyond preserving existing bounded execution;
 - multi-client or multi-scene sessions;
