@@ -1,16 +1,24 @@
 """Comprehensive Blender script executor with extensive error handling and logging."""
 
 import asyncio
+import contextlib
+import json
 
 # Third-party imports
 import logging
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import threading
 import time
+from collections.abc import Awaitable
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, Protocol, TypeVar
 
 import psutil
 
@@ -22,9 +30,27 @@ from ..exceptions import BlenderNotFoundError, BlenderScriptError
 
 # Type variable for the BlenderExecutor class
 T = TypeVar("T", bound="BlenderExecutor")
-
 # Global instance of BlenderExecutor
 _blender_executor_instance = None
+
+
+def _process_group_capability_available() -> bool:
+    """Return whether a fresh POSIX session can own the complete process tree."""
+    return os.name == "posix" and hasattr(os, "killpg") and hasattr(os, "setsid")
+
+
+async def _await_uninterruptibly(awaitable: Awaitable[Any]) -> Any:
+    """Finish a cleanup awaitable despite repeated cancellation requests."""
+    task = asyncio.ensure_future(awaitable)
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A shielded task keeps running.  If it is already done, propagate
+            # its own cancellation/result; otherwise absorb this cancellation
+            # and keep ownership until cleanup reaches a definite outcome.
+            if task.done():
+                return await task
 
 
 def get_blender_executor(blender_executable: str | None = None, headless: bool = True) -> "BlenderExecutor":
@@ -580,3 +606,718 @@ except Exception as user_error:
             self.cleanup()
         except Exception:
             pass  # Ignore errors in destructor
+
+
+# ---------------------------------------------------------------------------
+# Strict-headless compatibility executor
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StrictCommand:
+    """The only command representation accepted by the strict entry point."""
+
+    executable: str
+    argv: tuple[str, ...]
+
+    def __iter__(self):
+        return iter(self.argv)
+
+    def __len__(self) -> int:
+        return len(self.argv)
+
+    def __getitem__(self, index):
+        return self.argv[index]
+
+    def __post_init__(self) -> None:
+        if not self.executable:
+            raise ValueError("strict command requires a Blender executable")
+        prefix = (self.executable, "--background", "--factory-startup")
+        if self.argv[:3] != prefix:
+            raise ValueError("strict command must begin with executable and strict-headless flags")
+        forbidden = {"--no-background", "--window-geometry", "--window-border", "--start-console"}
+        if forbidden.intersection(self.argv):
+            raise ValueError("strict command cannot contain GUI-mode flags")
+        if self.argv[3:] == ("--version",):
+            return
+        try:
+            python_index = self.argv.index("--python")
+        except ValueError as exc:
+            raise ValueError("strict operation command requires a provider script") from exc
+        if python_index not in {3, 4}:
+            raise ValueError("strict operation command has an invalid scene position")
+        if python_index == 4 and not Path(self.argv[3]).is_absolute():
+            raise ValueError("strict command scene path must be absolute")
+        if python_index + 2 >= len(self.argv) or self.argv[python_index + 2] != "--":
+            raise ValueError("strict operation command must delimit operation arguments")
+        if not Path(self.argv[python_index + 1]).is_absolute():
+            raise ValueError("strict command provider script must be absolute")
+
+
+@dataclass(frozen=True)
+class RawBlenderObservation:
+    """Uninterpreted subprocess output; parsing belongs to the session boundary."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+class StrictFailureKind(StrEnum):
+    """Closed executor failure reasons, independent of display wording."""
+
+    COMMAND_INVALID = "command_invalid"
+    GUARD_UNAVAILABLE = "guard_unavailable"
+    SPAWN_FAILED = "spawn_failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    REAP_FAILED = "reap_failed"
+
+
+class StrictProcessGuard(Protocol):
+    """Capability used to deny descendant creation for execute-code."""
+
+    def available(self) -> bool:
+        ...
+
+    def wrap(self, argv: tuple[str, ...]) -> tuple[str, ...]:
+        ...
+
+
+def plan_strict_command(
+    executable: str,
+    scene_path: Path | None,
+    script_path: Path | None,
+    operation_args: tuple[str, ...] = (),
+    *,
+    version_probe: bool = False,
+) -> StrictCommand:
+    """Build the canonical argv for every strict-headless Blender invocation."""
+    if not executable:
+        raise ValueError("a Blender executable is required")
+    argv = [executable, "--background", "--factory-startup"]
+    if version_probe:
+        if scene_path is not None or script_path is not None or operation_args:
+            raise ValueError("a version probe cannot include scene or operation inputs")
+        argv.append("--version")
+        return StrictCommand(executable=executable, argv=tuple(argv))
+    if script_path is None or not script_path.is_absolute():
+        raise ValueError("provider scripts must use absolute paths")
+    if scene_path is not None:
+        if not scene_path.is_absolute():
+            raise ValueError("scene paths must be absolute")
+        argv.append(str(scene_path))
+    argv.extend(("--python", str(script_path), "--"))
+    argv.extend(operation_args)
+    return StrictCommand(executable=executable, argv=tuple(argv))
+
+
+# Compatibility aliases; there is still exactly one implementation.
+build_strict_argv = plan_strict_command
+plan_headless_argv = plan_strict_command
+
+
+def _sandbox_literal(path: str) -> str:
+    """Quote a literal path for the sandbox profile language."""
+    return path.replace("\\\\", "\\\\\\\\").replace('"', '\\\\"')
+
+
+def build_macos_process_profile(blender_executable: str, writable_root: str | Path | None = None) -> str:
+    """Return the macOS fork/exec and optional filesystem profile."""
+    literal = _sandbox_literal(blender_executable)
+    # The initial target launch needs this literal exception.  Author source
+    # is separately admitted against os.execv and friends; all other child
+    # process paths remain denied by the profile.  A strict operation also
+    # gets an explicit write capability: its private operation directory.
+    profile = (
+        '(version 1) (allow default) (deny process-fork) (deny process-exec) '
+        f'(allow process-exec (literal "{literal}"))'
+    )
+    if writable_root is not None:
+        root = _sandbox_literal(str(Path(writable_root).resolve()))
+        profile += f' (deny file-write*) (allow file-write* (subpath "{root}"))'
+    return profile
+
+
+class MacOSDescendantProcessGuard:
+    """sandbox-exec capability for the strict execute-code operation."""
+
+    def __init__(self, blender_executable: str) -> None:
+        self.blender_executable = blender_executable
+
+    def available(self) -> bool:
+        return sys.platform == "darwin" and shutil.which("sandbox-exec") is not None
+
+    def wrap(self, argv: tuple[str, ...]) -> tuple[str, ...]:
+        sandbox_exec = shutil.which("sandbox-exec")
+        if not self.available() or sandbox_exec is None:
+            raise StrictExecutionError(
+                StrictFailureKind.GUARD_UNAVAILABLE, "descendant process guard is unavailable"
+            )
+        profile = build_macos_process_profile(self.blender_executable)
+        return (sandbox_exec, "-p", profile, *argv)
+
+    def wrap_for_workspace(self, argv: tuple[str, ...], workspace: Path) -> tuple[str, ...]:
+        """Wrap a launch while granting writes only below ``workspace``."""
+        sandbox_exec = shutil.which("sandbox-exec")
+        if not self.available() or sandbox_exec is None:
+            raise StrictExecutionError(
+                StrictFailureKind.GUARD_UNAVAILABLE, "descendant process guard is unavailable"
+            )
+        profile = build_macos_process_profile(self.blender_executable, workspace)
+        return (sandbox_exec, "-p", profile, *argv)
+
+
+class StrictExecutionError(RuntimeError):
+    """Typed subprocess lifecycle failure before output can be parsed."""
+
+    def __init__(self, kind: StrictFailureKind, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+class StrictBlenderExecutor:
+    """Own fresh strict-headless Blender children from spawn through reap."""
+
+    def __init__(
+        self,
+        blender_executable: str,
+        *,
+        process_guard: StrictProcessGuard | None = None,
+        reap_grace_seconds: float = 2.0,
+        audit_path: str | Path | None = None,
+    ) -> None:
+        self.blender_executable = blender_executable
+        self.process_guard = process_guard or MacOSDescendantProcessGuard(blender_executable)
+        self.reap_grace_seconds = reap_grace_seconds
+        configured_audit = audit_path if audit_path is not None else os.environ.get("BLENDER_MCP_PROCESS_AUDIT_PATH")
+        self.audit_path = Path(configured_audit) if configured_audit else None
+        self.active_process: asyncio.subprocess.Process | None = None
+        self.active_process_group_id: int | None = None
+        # These are executor-owned capabilities, not local execute variables:
+        # teardown must be able to retry descendants after execute fails.
+        self.active_descendants: dict[int, psutil.Process] = {}
+        self.active_observed: dict[int, list[str]] = {}
+
+    async def _probe_executable(self, timeout: float) -> bool:
+        command = plan_strict_command(self.blender_executable, None, None, version_probe=True)
+        try:
+            observation = await self.execute(command, timeout=timeout)
+        except (StrictExecutionError, OSError, ValueError):
+            return False
+        lines = observation.stdout.splitlines()
+        return observation.returncode == 0 and bool(lines) and lines[0].startswith("Blender ")
+
+    def validate_executable(self, *, timeout: float = 20.0) -> bool:
+        """Validate Blender through this executor, including ownership and audit."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self._probe_executable(timeout))
+
+        result: list[bool] = []
+        failure: list[BaseException] = []
+
+        def run_probe() -> None:
+            try:
+                result.append(asyncio.run(self._probe_executable(timeout)))
+            except BaseException as exc:  # pragma: no cover - defensive thread handoff
+                failure.append(exc)
+
+        thread = threading.Thread(target=run_probe, name="blender-executable-probe")
+        thread.start()
+        thread.join()
+        if failure:
+            raise failure[0]
+        return result == [True]
+
+    async def execute(
+        self,
+        command: StrictCommand,
+        *,
+        timeout: float,
+        execute_code: bool = False,
+        cwd: Path | None = None,
+    ) -> RawBlenderObservation:
+        """Run one planned command without a shell and always reap its child."""
+        if command.executable != self.blender_executable:
+            raise StrictExecutionError(
+                StrictFailureKind.COMMAND_INVALID,
+                "command executable does not match configured executable",
+            )
+        guard_available = self.process_guard.available()
+        if execute_code and not guard_available:
+            self._write_process_audit(command, command.argv, {}, {}, None, None)
+            raise StrictExecutionError(
+                StrictFailureKind.GUARD_UNAVAILABLE, "descendant process guard is unavailable"
+            )
+        if guard_available:
+            try:
+                # On the accepted macOS host, apply both the no-descendant
+                # policy and the operation's private write capability.
+                wrap_for_workspace = getattr(self.process_guard, "wrap_for_workspace", None)
+                if cwd is not None and callable(wrap_for_workspace):
+                    launch_argv = wrap_for_workspace(command.argv, cwd)
+                else:
+                    launch_argv = self.process_guard.wrap(command.argv)
+            except StrictExecutionError:
+                self._write_process_audit(command, command.argv, {}, {}, None, None)
+                raise
+        else:
+            launch_argv = command.argv
+
+        spawn_kwargs = {
+            "stdin": asyncio.subprocess.DEVNULL,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+            "cwd": str(cwd) if cwd is not None else None,
+            "env": (
+                {
+                    **os.environ,
+                    # Blender creates transient files during startup. Keep
+                    # those writes inside the same capability directory.
+                    "TMPDIR": str(cwd),
+                    "TMP": str(cwd),
+                    "TEMP": str(cwd),
+                }
+                if cwd is not None
+                else os.environ.copy()
+            ),
+        }
+        if _process_group_capability_available():
+            # The process leader and every descendant share this fresh session
+            # and process group.  Ownership therefore does not depend on a
+            # best-effort psutil descendant poll.
+            spawn_kwargs["start_new_session"] = True
+        elif execute_code:
+            self._write_process_audit(command, command.argv, {}, {}, None, None)
+            raise StrictExecutionError(
+                StrictFailureKind.GUARD_UNAVAILABLE,
+                "process-group containment is unavailable for execute-code",
+            )
+        spawn_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(*launch_argv, **spawn_kwargs)
+        )
+        try:
+            process = await asyncio.shield(spawn_task)
+        except asyncio.CancelledError as exc:
+            # Shield process creation so cancellation cannot lose ownership of
+            # a child created between the syscall and handle publication.
+            try:
+                process = await _await_uninterruptibly(spawn_task)
+            except (FileNotFoundError, PermissionError):
+                self._write_process_audit(command, launch_argv, {}, {}, None, None)
+            else:
+                self.active_process = process
+                self.active_process_group_id = process.pid if _process_group_capability_available() else None
+                observed: dict[int, list[str]] = {}
+                self.active_observed = observed
+                self.active_descendants = {}
+                self._capture_process(process.pid, observed)
+                reap_failed: StrictExecutionError | None = None
+                try:
+                    await _await_uninterruptibly(
+                        self._terminate_and_reap(process, observed=observed)
+                    )
+                except StrictExecutionError as lifecycle_error:
+                    reap_failed = lifecycle_error
+                finally:
+                    self._write_process_audit(
+                        command, launch_argv, {}, observed, process.pid, None
+                    )
+                    if reap_failed is None:
+                        self.active_process = None
+                        self.active_process_group_id = None
+                        self.active_descendants = {}
+                        self.active_observed = {}
+                if reap_failed is not None:
+                    raise reap_failed
+            raise StrictExecutionError(
+                StrictFailureKind.CANCELLED, "Blender execution was cancelled during spawn"
+            ) from exc
+        except (FileNotFoundError, PermissionError) as exc:
+            self._write_process_audit(command, launch_argv, {}, {}, None, None)
+            raise StrictExecutionError(
+                StrictFailureKind.SPAWN_FAILED, f"could not start Blender: {exc}"
+            ) from exc
+
+        self.active_process = process
+        self.active_process_group_id = process.pid if _process_group_capability_available() else None
+        captured: dict[int, psutil.Process] = {}
+        observed: dict[int, list[str]] = {}
+        self.active_descendants = captured
+        self.active_observed = observed
+        direct_pid = process.pid
+        self._capture_process(direct_pid, observed)
+        tracker = asyncio.create_task(self._track_descendants(process, captured, observed))
+        observation: RawBlenderObservation | None = None
+        lifecycle_failure: StrictExecutionError | None = None
+        communication = asyncio.create_task(process.communicate())
+        # Process.wait() can wait on pipe closure, which an orphaned child can
+        # delay.  Poll only the direct leader's returncode to notice parent
+        # exit, then use the process group to close every inherited pipe.
+        process_exit = asyncio.create_task(self._poll_process_exit(process))
+        try:
+            done, _ = await asyncio.wait(
+                {communication, process_exit},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise TimeoutError
+            if process_exit in done and not communication.done():
+                # The direct parent exited while a descendant still owns a
+                # pipe.  Kill the whole fresh process group before reading EOF.
+                await _await_uninterruptibly(
+                    self._force_reap_process_group(process, self.active_process_group_id)
+                )
+            stdout, stderr = await _await_uninterruptibly(communication)
+            # The group is the ownership primitive; descendant snapshots are
+            # retained only for audit and supplemental cleanup.
+            await _await_uninterruptibly(
+                self._force_reap_process_group(process, self.active_process_group_id)
+            )
+            await self._reap_descendants(process, captured=captured, observed=observed)
+            await self._reap_captured(captured, force=True)
+            observation = RawBlenderObservation(
+                returncode=int(process.returncode or 0),
+                stdout=stdout.decode("utf-8", errors="replace"),
+                stderr=stderr.decode("utf-8", errors="replace"),
+            )
+            return observation
+        except TimeoutError as exc:
+            try:
+                await _await_uninterruptibly(
+                    self._terminate_and_reap(process, captured=captured, observed=observed)
+                )
+            except StrictExecutionError as hard_failure:
+                lifecycle_failure = hard_failure
+                raise
+            await _await_uninterruptibly(communication)
+            raise StrictExecutionError(
+                StrictFailureKind.TIMED_OUT, f"Blender timed out after {timeout:g}s"
+            ) from exc
+        except asyncio.CancelledError as exc:
+            try:
+                await _await_uninterruptibly(
+                    self._terminate_and_reap(process, captured=captured, observed=observed)
+                )
+            except StrictExecutionError as hard_failure:
+                lifecycle_failure = hard_failure
+                raise
+            await _await_uninterruptibly(communication)
+            raise StrictExecutionError(
+                StrictFailureKind.CANCELLED, "Blender execution was cancelled"
+            ) from exc
+        finally:
+            if not communication.done() and lifecycle_failure is not None:
+                communication.cancel()
+            process_exit.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _await_uninterruptibly(process_exit)
+            tracker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _await_uninterruptibly(tracker)
+            # Confirm the whole process group while the direct handle is
+            # still available, then force-reap snapshots for audit evidence. A
+            # failed reap is a hard lifecycle error: ownership stays published
+            # so teardown can retry instead of claiming the child is gone.
+            lifecycle_error: StrictExecutionError | None = lifecycle_failure
+            try:
+                await _await_uninterruptibly(
+                    self._force_reap_process_group(process, self.active_process_group_id)
+                )
+                await _await_uninterruptibly(
+                    self._reap_descendants(process, captured=captured, observed=observed, force=True)
+                )
+                await _await_uninterruptibly(self._reap_captured(captured, force=True))
+            except StrictExecutionError as exc:
+                lifecycle_error = exc
+            self._write_process_audit(command, launch_argv, captured, observed, direct_pid, observation)
+            if lifecycle_error is None:
+                self.active_process = None
+                self.active_process_group_id = None
+                self.active_descendants = {}
+                self.active_observed = {}
+            else:
+                # Keep both the direct process and every captured descendant
+                # available to teardown retry.
+                self.active_process = process
+                raise lifecycle_error
+
+    async def _poll_process_exit(self, process: asyncio.subprocess.Process) -> int:
+        """Observe direct leader exit without waiting for inherited pipes."""
+        while process.returncode is None:
+            await asyncio.sleep(0.01)
+        return int(process.returncode)
+
+    async def _track_descendants(
+        self,
+        process: asyncio.subprocess.Process,
+        captured: dict[int, psutil.Process],
+        observed: dict[int, list[str]],
+    ) -> None:
+        """Snapshot the direct process and descendants until parent exit."""
+        pid = getattr(process, "pid", None)
+        while process.returncode is None:
+            if isinstance(pid, int):
+                self._capture_process(pid, observed)
+            self._capture_descendants(process, captured, observed)
+            if isinstance(pid, int):
+                try:
+                    parent_status = psutil.Process(pid).status()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    # Group ownership, rather than this best-effort poll,
+                    # handles orphaned descendants.
+                    return
+                if parent_status == psutil.STATUS_ZOMBIE:
+                    return
+            await asyncio.sleep(0.02)
+        self._capture_descendants(process, captured, observed)
+
+    @staticmethod
+    def _capture_process(pid: int, observed: dict[int, list[str]]) -> None:
+        try:
+            observed[pid] = psutil.Process(pid).cmdline()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            observed.setdefault(pid, [])
+
+    def _capture_descendants(
+        self,
+        process: asyncio.subprocess.Process,
+        captured: dict[int, psutil.Process],
+        observed: dict[int, list[str]],
+    ) -> None:
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int):
+            return
+        try:
+            descendants = psutil.Process(pid).children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return
+        for child in descendants:
+            captured.setdefault(child.pid, child)
+            self._capture_process(child.pid, observed)
+
+    def _process_group_exists(self, group_id: int) -> bool:
+        if not _process_group_capability_available():
+            return False
+        try:
+            os.killpg(group_id, 0)
+        except ProcessLookupError:
+            return False
+        except OSError as exc:
+            raise StrictExecutionError(
+                StrictFailureKind.REAP_FAILED,
+                f"could not inspect Blender process group {group_id}: {exc}",
+            ) from exc
+        return True
+
+    async def _wait_process_group_gone(self, group_id: int) -> None:
+        deadline = time.monotonic() + self.reap_grace_seconds
+        while True:
+            try:
+                exists = self._process_group_exists(group_id)
+            except StrictExecutionError as exc:
+                # macOS can transiently report EPERM while a just-killed
+                # orphan is becoming unreapable; keep polling until the group
+                # reports ESRCH or the bounded reap grace is exhausted.
+                if not isinstance(exc.__cause__, PermissionError):
+                    raise
+                exists = True
+            if not exists:
+                return
+            if time.monotonic() >= deadline:
+                raise StrictExecutionError(
+                    StrictFailureKind.REAP_FAILED,
+                    f"Blender process group {group_id} did not reap",
+                )
+            await asyncio.sleep(0.01)
+
+    async def _force_reap_process_group(
+        self, process: asyncio.subprocess.Process, group_id: int | None
+    ) -> None:
+        """Kill and confirm the whole owned process group, independent of polling."""
+        if group_id is None or not _process_group_capability_available():
+            return
+        try:
+            group_exists = self._process_group_exists(group_id)
+        except StrictExecutionError:
+            raise
+        if not group_exists:
+            return
+        try:
+            os.killpg(group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except OSError as exc:
+            raise StrictExecutionError(
+                StrictFailureKind.REAP_FAILED,
+                f"could not kill Blender process group {group_id}: {exc}",
+            ) from exc
+        if process.returncode is None:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=self.reap_grace_seconds)
+            except (TimeoutError, ProcessLookupError) as exc:
+                raise StrictExecutionError(
+                    StrictFailureKind.REAP_FAILED,
+                    f"Blender process {getattr(process, 'pid', '<unknown>')} did not reap",
+                ) from exc
+        await self._wait_process_group_gone(group_id)
+
+    async def _terminate_and_reap(
+        self,
+        process: asyncio.subprocess.Process,
+        *,
+        captured: dict[int, psutil.Process] | None = None,
+        observed: dict[int, tuple[int, ...] | list[str]] | None = None,
+    ) -> None:
+        """Terminate the child and require a confirmed reap before returning."""
+        captured = captured if captured is not None else self.active_descendants
+        observed = observed if observed is not None else self.active_observed
+        group_id = self.active_process_group_id
+        lifecycle_error: StrictExecutionError | None = None
+        try:
+            await self._reap_descendants(process, captured=captured, observed=observed, force=False)
+        except StrictExecutionError as exc:
+            lifecycle_error = exc
+        if process.returncode is None:
+            try:
+                if group_id is not None:
+                    os.killpg(group_id, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                lifecycle_error = lifecycle_error or StrictExecutionError(
+                    StrictFailureKind.REAP_FAILED,
+                    f"could not terminate Blender process group {group_id}: {exc}",
+                )
+            try:
+                await asyncio.wait_for(process.wait(), timeout=self.reap_grace_seconds)
+            except (TimeoutError, ProcessLookupError):
+                pass
+        if process.returncode is None:
+            # SIGKILL the group, not just the direct child.  Descendant polling
+            # remains audit evidence, never the source of ownership.
+            try:
+                if group_id is not None:
+                    os.killpg(group_id, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                lifecycle_error = lifecycle_error or StrictExecutionError(
+                    StrictFailureKind.REAP_FAILED,
+                    f"could not kill Blender process group {group_id}: {exc}",
+                )
+            try:
+                await asyncio.wait_for(process.wait(), timeout=self.reap_grace_seconds)
+            except (TimeoutError, ProcessLookupError):
+                pass
+        if process.returncode is None:
+            raise StrictExecutionError(
+                StrictFailureKind.REAP_FAILED,
+                f"Blender child {getattr(process, 'pid', '<unknown>')} did not reap",
+            )
+        if group_id is not None:
+            try:
+                await self._force_reap_process_group(process, group_id)
+            except StrictExecutionError as exc:
+                lifecycle_error = lifecycle_error or exc
+        try:
+            await self._reap_captured(captured, force=True)
+        except StrictExecutionError as exc:
+            lifecycle_error = lifecycle_error or exc
+        if lifecycle_error is not None:
+            raise lifecycle_error
+        if self.active_process is process:
+            self.active_process = None
+            self.active_process_group_id = None
+            if self.active_descendants is captured:
+                self.active_descendants = {}
+            if self.active_observed is observed:
+                self.active_observed = {}
+
+    async def _reap_captured(self, captured: dict[int, psutil.Process], *, force: bool) -> None:
+        for child in tuple(captured.values()):
+            try:
+                (child.kill if force else child.terminate)()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        for child in tuple(captured.values()):
+            try:
+                await asyncio.to_thread(child.wait, timeout=self.reap_grace_seconds)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                if not force:
+                    continue
+                try:
+                    child.kill()
+                    await asyncio.to_thread(child.wait, timeout=self.reap_grace_seconds)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired) as exc:
+                    raise StrictExecutionError(
+                        StrictFailureKind.REAP_FAILED,
+                        f"descendant process {child.pid} did not reap",
+                    ) from exc
+            if force and psutil.pid_exists(child.pid):
+                raise StrictExecutionError(
+                    StrictFailureKind.REAP_FAILED,
+                    f"descendant process {child.pid} remains owned after reap",
+                )
+
+    async def _reap_descendants(
+        self,
+        process: asyncio.subprocess.Process,
+        *,
+        force: bool = False,
+        captured: dict[int, psutil.Process] | None = None,
+        observed: dict[int, tuple[int, ...] | list[str]] | None = None,
+    ) -> None:
+        """Snapshot and clean children, including those captured pre-exit."""
+        captured = captured if captured is not None else self.active_descendants
+        observed = observed if observed is not None else self.active_observed
+        self._capture_descendants(process, captured, observed)
+        await self._reap_captured(captured, force=force)
+
+    def _write_process_audit(
+        self,
+        command: StrictCommand,
+        launch_argv: tuple[str, ...],
+        captured: dict[int, psutil.Process],
+        observed: dict[int, list[str]],
+        direct_pid: int | None,
+        observation: RawBlenderObservation | None,
+    ) -> None:
+        if self.audit_path is None:
+            return
+        record = {
+            "planned_argv": list(command.argv),
+            "launch_argv": list(launch_argv),
+            "direct_process": (
+                {"pid": direct_pid, "cmdline": list(observed.get(direct_pid, []))}
+                if direct_pid is not None
+                else None
+            ),
+            "provider_processes": [
+                {"pid": pid, "cmdline": list(cmdline)} for pid, cmdline in sorted(observed.items())
+            ],
+            "provider_descendants": [
+                {"pid": pid, "cmdline": list(observed.get(pid, []))} for pid in sorted(captured)
+            ],
+            "direct_process_gone": direct_pid is None or not psutil.pid_exists(direct_pid),
+            "descendants_gone": all(not psutil.pid_exists(pid) for pid in captured),
+            "returncode": observation.returncode if observation is not None else None,
+        }
+        try:
+            self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.audit_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+        except OSError:
+            logger.warning("could not write strict process audit: %s", self.audit_path)
+
+
+HeadlessBlenderExecutor = StrictBlenderExecutor
+StrictHeadlessExecutor = StrictBlenderExecutor
+StrictHeadlessCommand = StrictCommand

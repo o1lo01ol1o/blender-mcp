@@ -88,6 +88,7 @@ monitoring = [
 [project.scripts]
 blender-mcp = "blender_mcp.cli:main"
 blender-mcp-server = "blender_mcp.server:main_stdio"
+blender-mcp-headless = "blender_mcp.headless_server:main"
 
 [project.entry-points."mcp.servers"]
 blender-mcp = "blender_mcp.server:create_server"

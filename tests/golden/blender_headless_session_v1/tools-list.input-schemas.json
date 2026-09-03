@@ -1,0 +1,85 @@
+{
+  "blender_camera_render_preview": {
+    "additionalProperties": false,
+    "properties": {
+      "max_size": {
+        "default": 800,
+        "maximum": 2048,
+        "minimum": 64,
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "blender_execute_code": {
+    "additionalProperties": false,
+    "properties": {
+      "code": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "code"
+    ],
+    "type": "object"
+  },
+  "blender_export_scene": {
+    "additionalProperties": false,
+    "properties": {
+      "format": {
+        "enum": [
+          "blend",
+          "glb",
+          "gltf",
+          "obj",
+          "fbx",
+          "usd",
+          "usdc"
+        ],
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      },
+      "selection_only": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "path",
+      "format",
+      "selection_only"
+    ],
+    "type": "object"
+  },
+  "blender_get_scene_info": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "blender_import_asset": {
+    "additionalProperties": false,
+    "properties": {
+      "format": {
+        "enum": [
+          "glb",
+          "gltf",
+          "obj",
+          "fbx",
+          "usd",
+          "usdc",
+          "usdz"
+        ],
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "path",
+      "format"
+    ],
+    "type": "object"
+  }
+}
