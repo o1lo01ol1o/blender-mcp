@@ -16,7 +16,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 
-from blender_mcp.headless_session import validate_preview_png
+from blender_mcp.headless_session import _is_plausible_blend_file, validate_preview_png
 from blender_mcp.utils.blender_executor import plan_strict_command
 
 EXPLICIT_BLENDER = Path("/Applications/Blender.app/Contents/MacOS/Blender")
@@ -164,7 +164,7 @@ def test_headless_stdio_sigterm_removes_private_workspace(tmp_path: Path):
 @pytest.mark.asyncio
 @pytest.mark.integration
 @pytest.mark.slow
-@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit Blender 4.2.3 executable is unavailable")
+@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit supported Blender executable is unavailable")
 async def test_real_fastmcp_stdio_headless_scene_flow(tmp_path: Path):
     root = Path(__file__).parents[2]
     approved = tmp_path / "approved"
@@ -233,7 +233,7 @@ async def test_real_fastmcp_stdio_headless_scene_flow(tmp_path: Path):
             "blender_export_scene", {"path": str(exported), "format": "blend", "selection_only": False}
         )
         assert json.loads(export_result.content[0].text)["scene_revision"] == 2
-        assert exported.read_bytes().startswith(b"BLENDER-v402")
+        assert _is_plausible_blend_file(exported)
 
     assert not list(session_temp.glob("blender-headless-session-*")), (
         "stdio shutdown must remove the private scene-session workspace"
@@ -255,7 +255,7 @@ async def test_real_fastmcp_stdio_headless_scene_flow(tmp_path: Path):
         text=True,
         check=False,
     )
-    assert re.search(r"Blender 4\.2\.3(?: LTS)?", version.stdout)
+    assert re.search(r"Blender (?:4\.2\.3|5\.2\.\d+)(?: LTS)?", version.stdout)
     records = [json.loads(line) for line in audit.read_text().splitlines()]
     assert len(records) == 6
     assert records[0]["planned_argv"][-1] == "--version"

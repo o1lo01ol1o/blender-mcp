@@ -15,9 +15,9 @@ EXPLICIT_BLENDER = Path("/Applications/Blender.app/Contents/MacOS/Blender")
 
 @pytest.mark.integration
 @pytest.mark.slow
-@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit Blender 4.2.3 executable is unavailable")
+@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit supported Blender executable is unavailable")
 @pytest.mark.asyncio
-async def test_real_blender_4_2_3_scene_session(tmp_path: Path):
+async def test_real_supported_blender_scene_session(tmp_path: Path):
     approved_root = tmp_path / "approved"
     approved_root.mkdir()
     session = SceneSession(
@@ -86,7 +86,7 @@ bpy.context.object.name = 'Cube_B'
 
 @pytest.mark.integration
 @pytest.mark.slow
-@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit Blender 4.2.3 executable is unavailable")
+@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit supported Blender executable is unavailable")
 @pytest.mark.asyncio
 async def test_failed_malicious_mutation_cannot_overwrite_previous_revision(tmp_path: Path):
     session = SceneSession(
@@ -120,7 +120,7 @@ async def test_failed_malicious_mutation_cannot_overwrite_previous_revision(tmp_
 
 @pytest.mark.integration
 @pytest.mark.slow
-@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit Blender 4.2.3 executable is unavailable")
+@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit supported Blender executable is unavailable")
 @pytest.mark.asyncio
 async def test_teardown_reaps_active_real_blender_child(tmp_path: Path):
     session = SceneSession(
@@ -140,7 +140,7 @@ async def test_teardown_reaps_active_real_blender_child(tmp_path: Path):
 
 @pytest.mark.integration
 @pytest.mark.slow
-@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit Blender 4.2.3 executable is unavailable")
+@pytest.mark.skipif(not EXPLICIT_BLENDER.is_file(), reason="explicit supported Blender executable is unavailable")
 @pytest.mark.asyncio
 async def test_macos_guard_denies_descendant_process_launch(tmp_path: Path):
     script = tmp_path / "attempt-child.py"
