@@ -969,19 +969,28 @@ def _parse_export_result(data: dict[str, Any], revision: int, output_path: Path,
 
 
 def _is_plausible_blend_file(path: Path) -> bool:
-    """Recognize Blender's fixed 12-byte file signature, not just bytes."""
+    """Recognize Blender's uncompressed legacy or v5 file header."""
     try:
         with path.open("rb") as stream:
-            header = stream.read(12)
+            header = stream.read(17)
     except OSError:
         return False
-    return (
-        len(header) == 12
+    legacy_header = (
+        len(header) >= 12
         and header[:7] == b"BLENDER"
         and header[7:8] in {b"-", b"_"}
         and header[8:9] in {b"v", b"V"}
         and header[9:12].isdigit()
     )
+    extended_header = (
+        len(header) == 17
+        and header[:9] == b"BLENDER17"
+        and header[9:10] == b"-"
+        and header[10:12].isdigit()
+        and header[12:13] in {b"v", b"V"}
+        and header[13:17].isdigit()
+    )
+    return legacy_header or extended_header
 
 
 def _validate_png(data: bytes, max_size: int) -> tuple[int, int]:
@@ -1078,7 +1087,7 @@ def _parse_sentinel(stdout: str) -> dict[str, Any]:
 
 
 def _script_header() -> str:
-    return f"""import bpy\nimport json\nimport sys\n\n_SENTINEL = {SENTINEL_PREFIX!r}\n_VERSION = {WIRE_VERSION!r}\n\ndef _emit(data=None, *, error_code=None, error_message=None):\n    payload = {{'wire_version': _VERSION, 'ok': error_code is None}}\n    if error_code is None:\n        payload['data'] = data or {{}}\n    else:\n        payload['error_code'] = error_code\n        payload['error_message'] = error_message or 'Blender operation failed'\n    print(_SENTINEL + json.dumps(payload, sort_keys=True, separators=(',', ':')))\n\ndef _prepare_private_scene(path):\n    # Saving once before author code makes bpy.data.filepath point at the\n    # private next-revision path; BlendData.filepath itself is read-only.\n    bpy.ops.wm.save_as_mainfile(filepath=path)\n\ndef _save_and_inspect(path):\n    bpy.ops.wm.save_as_mainfile(filepath=path)\n    bpy.ops.wm.open_mainfile(filepath=path)\n    if bpy.data.filepath != path:\n        raise RuntimeError('saved scene could not be reopened for inspection')\n\n"""
+    return f"""import bpy\nimport json\nimport sys\n\n_SENTINEL = {SENTINEL_PREFIX!r}\n_VERSION = {WIRE_VERSION!r}\n\ndef _emit(data=None, *, error_code=None, error_message=None):\n    payload = {{'wire_version': _VERSION, 'ok': error_code is None}}\n    if error_code is None:\n        payload['data'] = data or {{}}\n    else:\n        payload['error_code'] = error_code\n        payload['error_message'] = error_message or 'Blender operation failed'\n    print(_SENTINEL + json.dumps(payload, sort_keys=True, separators=(',', ':')))\n\ndef _prepare_private_scene(path):\n    # Saving once before author code makes bpy.data.filepath point at the\n    # private next-revision path; BlendData.filepath itself is read-only.\n    # Keep revisions uncompressed so the provider can verify Blender's\n    # versioned file header without treating arbitrary compressed bytes as a\n    # scene. Blender 5 enables zstd compression by default.\n    bpy.ops.wm.save_as_mainfile(filepath=path, compress=False)\n\ndef _save_and_inspect(path):\n    bpy.ops.wm.save_as_mainfile(filepath=path, compress=False)\n    bpy.ops.wm.open_mainfile(filepath=path)\n    if bpy.data.filepath != path:\n        raise RuntimeError('saved scene could not be reopened for inspection')\n\n"""
 
 
 def build_provider_script(
@@ -1126,7 +1135,7 @@ def build_provider_script(
             raise ValueError("export requires output path and format")
         selection_flag = "True" if selection_only else "False"
         if export_format is ExportFormat.BLEND:
-            export_call = "bpy.ops.wm.save_as_mainfile(filepath=_path)"
+            export_call = "bpy.ops.wm.save_as_mainfile(filepath=_path, compress=False)"
         elif export_format in (ExportFormat.GLB, ExportFormat.GLTF):
             export_mode = "GLB" if export_format is ExportFormat.GLB else "GLTF_SEPARATE"
             export_call = (

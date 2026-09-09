@@ -31,12 +31,17 @@ process, or any host-visible Blender window. Visual observation is a camera
 render produced by background Blender.
 
 The Blender executable is supplied through `BLENDER_EXECUTABLE`. The real
-local acceptance target is:
+local acceptance target is the explicit application path and either the 4.2.3
+baseline or the reviewed 5.2 LTS compatibility line:
 
 ```text
 /Applications/Blender.app/Contents/MacOS/Blender
-Blender 4.2.3 LTS
+Blender 4.2.3 LTS or Blender 5.2.x LTS
 ```
+
+Private revisions and `.blend` exports are saved uncompressed. This makes the
+legacy 12-byte or Blender 5 17-byte versioned header directly inspectable;
+arbitrary zstd data is not accepted as a scene merely because it is compressed.
 
 Discovery of another installation may remain available to the rest of this
 repository, but the prototype entry point fails clearly when its explicit
@@ -416,7 +421,7 @@ the prototype compatibility entry point does not register it in addition to
 - A failed mutation preserves the preceding scene revision.
 - Cancellation and timeout reap the child and do not publish a revision.
 
-### Real Blender 4.2.3 session
+### Real supported-Blender session
 
 Using the explicit macOS Blender executable:
 

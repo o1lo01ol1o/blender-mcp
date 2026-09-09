@@ -19,6 +19,7 @@ from blender_mcp.headless_session import (
     ProviderError,
     SceneSession,
     _directory_capabilities,
+    _is_plausible_blend_file,
     _parse_execute_result,
     _parse_scene_info,
     _parse_sentinel,
@@ -132,6 +133,23 @@ def test_strict_planner_has_only_headless_flags(tmp_path: Path):
                 "--window-geometry",
             ),
         )
+
+
+@pytest.mark.unit
+def test_plausible_blend_file_accepts_legacy_and_blender_5_headers(tmp_path: Path):
+    legacy = tmp_path / "legacy.blend"
+    legacy.write_bytes(b"BLENDER-v423" + b"payload")
+    extended = tmp_path / "extended.blend"
+    extended.write_bytes(b"BLENDER17-01v0502" + b"payload")
+    compressed = tmp_path / "compressed.blend"
+    compressed.write_bytes(b"\x28\xb5\x2f\xfd" + b"not-a-verifiable-header")
+    malformed = tmp_path / "malformed.blend"
+    malformed.write_bytes(b"BLENDER17-01v05x2")
+
+    assert _is_plausible_blend_file(legacy)
+    assert _is_plausible_blend_file(extended)
+    assert not _is_plausible_blend_file(compressed)
+    assert not _is_plausible_blend_file(malformed)
 
 
 def test_prototype_sources_contain_no_gui_or_virtual_display_path():
