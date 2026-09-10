@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastmcp import FastMCP
 
 from blender_mcp.headless_session import SceneSession
-from blender_mcp.tools.headless_session_tools import register_headless_session_tools
+from blender_mcp.headless_session_tools import register_headless_session_tools
 
 logger = logging.getLogger(__name__)
 

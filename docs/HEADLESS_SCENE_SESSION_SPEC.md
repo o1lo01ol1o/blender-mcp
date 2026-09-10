@@ -388,7 +388,7 @@ Expected implementation locations are:
 ```text
 src/blender_mcp/server.py                         # reliable explicit stdio entry
 src/blender_mcp/headless_session.py               # checked session state/lifecycle
-src/blender_mcp/tools/headless_session_tools.py   # five narrow MCP registrations
+src/blender_mcp/headless_session_tools.py         # five narrow MCP registrations
 src/blender_mcp/utils/blender_executor.py         # one strict argv planner/executor
 tests/unit/test_headless_session.py
 tests/unit/test_headless_session_tools.py

@@ -157,7 +157,7 @@ def test_prototype_sources_contain_no_gui_or_virtual_display_path():
     sources = [
         root / "src/blender_mcp/headless_server.py",
         root / "src/blender_mcp/headless_session.py",
-        root / "src/blender_mcp/tools/headless_session_tools.py",
+        root / "src/blender_mcp/headless_session_tools.py",
     ]
     prototype_source = "\n".join(path.read_text() for path in sources)
     for forbidden in (
