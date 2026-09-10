@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,6 +16,28 @@ from blender_mcp.utils.blender_executor import MacOSDescendantProcessGuard, buil
 
 
 @pytest.mark.unit
+def test_headless_server_import_does_not_discover_broad_tool_package():
+    root = Path(__file__).parents[2]
+    env = {**os.environ, "PYTHONPATH": str(root / "src")}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import blender_mcp.headless_server; "
+            "print('blender_mcp.tools' in sys.modules)",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "False\n"
+    assert "Failed to import tool module" not in result.stderr
+
+
 def test_invalid_explicit_executable_fails_before_workspace_creation(tmp_path: Path):
     workspace = tmp_path / "must-not-exist"
     with pytest.raises(ProviderError) as caught:
